@@ -1,54 +1,73 @@
 # Diplomski IBVS
 
-Initial IBVS workspace for UAV control development.
+IBVS (Image-Based Visual Servoing) pipeline for UAV control. Core non-ROS implementation.
 
-## Current implementation
-- `pipeline/IBVSContext.py`: frame/point/feature context container
-- `pipeline/IBVSPipeline.py`: frame loop + feature extraction orchestration
-- `sources/FrameSource.py`: source interface
-- `sources/MP4Source.py`: MP4-only IBVS input source
-- `sources/DetectionPipelineSource.py`: adapter from detection pipeline context to IBVS source contract
-- `feature_extraction/FASTHarrisExtractor.py`: FAST keypoints ranked by Harris response
-- `feature_extraction/AprilTagExtractor.py`: optional AprilTag center extraction
-- `feature_extraction/FeatureSelector.py`: extraction interface
-- `main.py`: simple local entry with IBVS helper + imported detection-pipeline main hook
+## Architecture
 
-## Run
+- `pipeline/`: Core orchestration
+  - `IBVSPipeline.py`: frame loop + feature extraction
+  - `IBVSContext.py`: frame/point/feature context container
+- `sources/`: Input adapters (abstract `FrameSource`)
+  - `MP4Source.py`: video file input
+  - `DetectionPipelineSource.py`: detection pipeline context adapter
+- `feature_extraction/`: Visual feature detection
+  - `FASTHarrisExtractor.py`: FAST + Harris corner ranking
+  - `AprilTagExtractor.py`: optional AprilTag marker centers
+  - `FeatureSelector.py`: extraction interface
+- `config/`: Configuration management
+  - `default_config.yaml`: IBVS parameters
+- `main.py`: Entry point (matches detection pipeline structure)
+- `tests/`: Pre-merge validation tests
 
-### IBVS-only with MP4 source (simple)
+## Quick Start
+
+### Run IBVS with MP4 source
+
 ```bash
-python3 -c "from main import run_ibvs_with_mp4; run_ibvs_with_mp4('/absolute/path/to/video.mp4', max_frames=100)"
+python3 main.py
 ```
 
-### Detection pipeline main (imported, not duplicated)
+Configure via `config/default_config.yaml` or environment:
+
 ```bash
-python3 -c "from main import run_detection_pipeline_main; run_detection_pipeline_main()"
+export IBVS_VIDEO_PATH=/path/to/video.mp4
+export IBVS_MAX_FEATURES=80
+python3 main.py
 ```
 
-## Tests
+### Tests
 
-### 1) IBVS-only MP4 test (pre-merge path)
+Run pre-merge validation:
 ```bash
-python3 -m unittest tests.test_ibvs_mp4_source -v
+python3 -m unittest discover
 ```
 
-### 2) Full detection+IBVS integration test
+Optional: Full detection+IBVS integration test:
 ```bash
 export IBVS_RUN_DETECTION_INTEGRATION=1
 export IBVS_DETECTION_REPO=../detection_pipeline
-export IBVS_DETECTION_VIDEO=/absolute/path/to/video.mp4
-export IBVS_DETECTION_MODEL=/absolute/path/to/best_small.pt
-python3 -m unittest tests.test_integration_detection_pipeline -v
+export IBVS_DETECTION_VIDEO=/path/to/video.mp4
+export IBVS_DETECTION_MODEL=/path/to/model.pt
+python3 -m unittest discover
 ```
 
-This integration test is intentionally opt-in because it depends on detection assets and heavier dependencies, and it feeds detection context into IBVS via `DetectionPipelineSource`.
+## Configuration
+
+See `config/default_config.yaml` for all tunable parameters:
+- Source type (mp4 / detection)
+- Feature extraction thresholds (FAST, Harris)
+- Visualization toggles
 
 ## Notes
-- FAST+Harris is the default feature extraction direction for IBVS control.
-- AprilTag extraction is optional and requires the `apriltag` Python package.
+
+- Core is framework-agnostic (non-ROS for simplicity and testing)
+- ROS adapter layer planned as separate module
+- Detection pipeline integration via context adapter (simple, no duplication)
+- FAST+Harris is primary feature extraction method
 
 ## References
-- https://visp-doc.inria.fr/doxygen/visp-daily/tutorial-ibvs.html
-- https://joy-it.net/files/files/Produkte/rb-camera_JT/rb-camera_JT_Datasheet_2021-02-09.pdf
-- https://pyimagesearch.com/2020/11/02/apriltag-with-python/
-- https://docs.opencv.org/4.x/dc/d0d/tutorial_py_features_harris.html
+
+- IBVS theory: https://visp-doc.inria.fr/doxygen/visp-daily/tutorial-ibvs.html
+- Camera specs: https://joy-it.net/files/files/Produkte/rb-camera_JT/rb-camera_JT_Datasheet_2021-02-09.pdf
+- AprilTag: https://pyimagesearch.com/2020/11/02/apriltag-with-python/
+- Harris corners: https://docs.opencv.org/4.x/dc/d0d/tutorial_py_features_harris.html

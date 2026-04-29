@@ -25,6 +25,7 @@ class IBVSPipeline:
         return ret, frame, point
 
     def run(self):
+        
         while True:
             ret, frame, point = self._read_source_frame()
             if not ret or frame is None:
