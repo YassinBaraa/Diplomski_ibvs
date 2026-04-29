@@ -10,7 +10,19 @@ class IBVSPipeline:
         self.feature_extractor = feature_extractor
 
     def _read_source_frame(self):
-        pass
+        read_output = self.source.read()
+        if not isinstance(read_output, tuple):
+            raise TypeError("source.read() must return a tuple")
+
+        if len(read_output) == 3:
+            ret, frame, point = read_output
+        elif len(read_output) == 2:
+            ret, frame = read_output
+            point = None
+        else:
+            raise ValueError("source.read() must return (ret, frame) or (ret, frame, point)")
+
+        return ret, frame, point
 
     def run(self):
         while True:
