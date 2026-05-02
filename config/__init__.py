@@ -96,3 +96,6 @@ class ConfigManager:
 
     def __repr__(self) -> str:
         return f"ConfigManager(path={self.config_path})"
+
+# Backwards-compatible alias expected by older code
+Config = ConfigManager

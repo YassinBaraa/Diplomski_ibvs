@@ -3,7 +3,7 @@
 # Source Configuration
 source:
   type: "mp4"  # "mp4" or "detection"
-  video_path: "sources/example.mp4"  # Path to video file
+  video_path: "sources/apriltag_test.mp4"  # Path to video file
 
 # Feature Extraction Configuration (FAST + Harris)
 feature_extraction:
@@ -14,7 +14,3 @@ feature_extraction:
   harris_k: 0.04
   point_focus_radius: null  # Optional: focus on target point with this radius (pixels)
 
-# Visualization
-visualization:
-  enabled: true
-  display_window_name: "IBVS Pipeline"
