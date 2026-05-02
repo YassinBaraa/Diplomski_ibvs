@@ -7,12 +7,11 @@ if project_root_str in sys.path:
     sys.path.remove(project_root_str)
 sys.path.insert(0, project_root_str)
 
-from sources.MP4Source import MP4Source
-from sources.DetectionPipelineSource import DetectionPipelineSource
-from feature_extraction.FASTHarrisExtractor import FASTHarrisExtractor
-from controller.PointController import PointController
-from pipeline.IBVSPipeline import IBVSPipeline
-from config import Config
+from ibvs_ros.sources.MP4Source import MP4Source
+from ibvs_ros.sources.DetectionPipelineSource import DetectionPipelineSource
+from ibvs_ros.feature_extraction.FASTHarrisExtractor import FASTHarrisExtractor
+from ibvs_ros.controller.PointController import PointController
+from ibvs_ros.pipeline.IBVSPipeline import IBVSPipeline
 
 import cv2
 

@@ -1,0 +1,14 @@
+# IBVS ROS Configuration
+
+# Controller parameters
+controller_gain: 0.5          # Proportional gain
+max_feature_motion_px: 50.0   # Max feature motion for validation
+fallback_enabled: true        # Use feature centroid if detection point is None
+fallback_gain_scale: 0.5      # Scale factor for fallback velocity
+
+# Target point (None = image center)
+# target_x: 320
+# target_y: 240
+
+# Visualization
+enable_visualization: false   # Show OpenCV window (useful for debugging)

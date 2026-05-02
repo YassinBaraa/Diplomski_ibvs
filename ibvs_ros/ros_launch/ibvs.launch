@@ -1,0 +1,16 @@
+<?xml version="1.0"?>
+<launch>
+  <!-- Load configuration from YAML -->
+  <rosparam command="load" file="$(find ibvs)/ibvs_ros/ros_config/ibvs_ros.yaml" ns="ibvs_node" />
+
+  <!-- IBVS Node -->
+  <node pkg="ibvs" type="ibvs_node.py" name="ibvs_node" output="screen">
+    <!-- Parameters can also be overridden here -->
+    <!-- <param name="controller_gain" value="0.5" />
+    <param name="max_feature_motion_px" value="50.0" />
+    <param name="fallback_enabled" value="true" />
+    <param name="fallback_gain_scale" value="0.5" />
+    <param name="enable_visualization" value="false" /> -->
+  </node>
+
+</launch>
