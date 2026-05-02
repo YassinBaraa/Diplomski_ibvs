@@ -1,5 +1,12 @@
 import numpy as np
+import sys
+from pathlib import Path
 from sources.FrameSource import FrameSource
+
+# Add detection_pipeline to path
+detection_pipeline_path = Path(__file__).parent.parent.parent / "detection_pipeline"
+if str(detection_pipeline_path) not in sys.path:
+    sys.path.insert(0, str(detection_pipeline_path))
 
 
 class DetectionPipelineSource(FrameSource):
