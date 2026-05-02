@@ -1,7 +1,6 @@
 from sources.MP4Source import MP4Source
 #from sources.DetectionPipelineSource import DetectionPipelineSource
-from feature_extraction.AprilTagExtractor import AprilTagExtractor
-#from feature_extraction import FASTHarrisExtractor
+from feature_extraction.FASTHarrisExtractor import FASTHarrisExtractor
 from pipeline.IBVSPipeline import IBVSPipeline
 from config import Config
 
@@ -21,8 +20,14 @@ def main():
     source = MP4Source(config.get("source.video_path"))
     #source = DetectionPipelineSource(config.get("sources.detection_pipeline_path")) # find a better way torun the pipeline
 
-    feature_extractor = AprilTagExtractor()
-    #feature_extractor = FASTHarrisExtractor(config.get("feature_extraction.fastharris")) 
+    feature_extractor = FASTHarrisExtractor(
+        max_features=config.get("feature_extraction.max_features"),
+        fast_threshold=config.get("feature_extraction.fast_threshold"),
+        harris_block_size=config.get("feature_extraction.harris_block_size"),
+        harris_ksize=config.get("feature_extraction.harris_ksize"),
+        harris_k=config.get("feature_extraction.harris_k"),
+        point_focus_radius=config.get("feature_extraction.point_focus_radius"),
+    )
 
     pipeline = IBVSPipeline(
         source=source,
