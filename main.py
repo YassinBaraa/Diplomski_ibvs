@@ -18,7 +18,7 @@ import cv2
 
 
 def get_detection_pipeline_iterator():
-    """Initialize and run the detection pipeline, return the iterator."""
+
     detection_pipeline_path = Path(__file__).parent.parent / "detection_pipeline"
     detection_pipeline_path_str = str(detection_pipeline_path)
     if detection_pipeline_path_str in sys.path:
@@ -31,8 +31,6 @@ def get_detection_pipeline_iterator():
         sys.path.remove(project_root_str)
         removed_project_root = True
 
-    # Resolve naming collisions because both repos use top-level packages like
-    # `pipeline`, `sources`, and `config`.
     for module_name in list(sys.modules.keys()):
         if (
             module_name == "pipeline"
