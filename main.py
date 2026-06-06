@@ -122,7 +122,7 @@ def main():
 
         # Draw velocity arrow from frame center — direction and length show where/how hard to move
         if velocity is not None and np.linalg.norm(velocity) > 0.5:
-            arrow_scale = 2.0  # px per unit velocity for display
+            arrow_scale = 2.0
             tip = (
                 int(center[0] + velocity[0] * arrow_scale),
                 int(center[1] + velocity[1] * arrow_scale),
@@ -132,6 +132,12 @@ def main():
         cv2.imshow('IBVS', vis)
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
+
+        yield {
+            "error_x": float(error[0]) if error is not None else None,
+            "error_y": float(error[1]) if error is not None else None,
+            "distance_mm": ctx.distance_mm,
+        }
 
     source.release()
     cv2.destroyAllWindows()
