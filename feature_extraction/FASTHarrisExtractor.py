@@ -51,7 +51,7 @@ class FASTHarrisExtractor(FeatureSelector):
             if yi < 0 or yi >= harris_response.shape[0] or xi < 0 or xi >= harris_response.shape[1]:
                 continue
 
-            if target_xy is not None and self.point_focus_radius is not None:
+            if ctx.warmup_complete and target_xy is not None and self.point_focus_radius is not None:
                 if np.linalg.norm(np.asarray([x, y], dtype=np.float32) - target_xy) > self.point_focus_radius:
                     continue
 

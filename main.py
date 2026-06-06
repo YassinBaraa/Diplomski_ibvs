@@ -10,81 +10,45 @@ sys.path.insert(0, project_root_str)
 from sources.MP4Source import MP4Source
 from sources.DetectionPipelineSource import DetectionPipelineSource
 from feature_extraction.FASTHarrisExtractor import FASTHarrisExtractor
+from trackers.KLTTracker import KLTTracker
 from controller.PointController import PointController
 from pipeline.IBVSPipeline import IBVSPipeline
 from config import Config
 
 import cv2
+import numpy as np
 
 
 def get_detection_pipeline_iterator():
+    detection_pipeline_path = str(Path(__file__).parent.parent / "detection_pipeline")
 
-    detection_pipeline_path = Path(__file__).parent.parent / "detection_pipeline"
-    detection_pipeline_path_str = str(detection_pipeline_path)
-    if detection_pipeline_path_str in sys.path:
-        sys.path.remove(detection_pipeline_path_str)
-    sys.path.insert(0, detection_pipeline_path_str)
-
-    # Temporarily remove ibvs root to avoid package shadowing during detection imports.
-    removed_project_root = False
+    # Remove ibvs root so detection pipeline's own packages (pipeline, sources, config) resolve correctly
     if project_root_str in sys.path:
         sys.path.remove(project_root_str)
-        removed_project_root = True
 
+    if detection_pipeline_path not in sys.path:
+        sys.path.insert(0, detection_pipeline_path)
+
+    # Clear shadowed ibvs modules so detection pipeline re-imports from its own path
     for module_name in list(sys.modules.keys()):
         if (
-            module_name == "pipeline"
-            or module_name.startswith("pipeline.")
-            or module_name == "sources"
-            or module_name.startswith("sources.")
-            or module_name == "config"
-            or module_name.startswith("config.")
+            module_name == "pipeline" or module_name.startswith("pipeline.")
+            or module_name == "sources" or module_name.startswith("sources.")
+            or module_name == "config" or module_name.startswith("config.")
+            or module_name == "postprocessing" or module_name.startswith("postprocessing.")
+            or module_name == "main"
         ):
             del sys.modules[module_name]
-    
+
     try:
-        from sources.MP4Source import MP4Source as DP_MP4Source
-        from detectors.YOLOBranchSeg import YOLOBranchSeg
-        from trackers.ByteTrack import ByteTrack
-        from postprocessing.PostProcessor import PostProcessor
-        from postprocessing.masks.MaskExtraction import MaskExtraction
-        from postprocessing.geometry.DistanceHeatmap import DistanceHeatmap
-        from postprocessing.geometry.BitmaskSkeleton import BitmaskSkeleton
-        from postprocessing.scoring.CandidateScoring import CandidateScoring
-        from postprocessing.scoring.CandidateVisualizer import CandidateVisualizer
-        from pipeline.DetectionPipeline import DetectionPipeline
-        from config import ConfigManager
+        import main as dp_main
+        iterator = dp_main.main()
     finally:
-        if removed_project_root:
+        # Restore ibvs root so the rest of ibvs imports still work
+        if project_root_str not in sys.path:
             sys.path.insert(0, project_root_str)
-    
-    # Load detection pipeline config
-    config_dp = ConfigManager()
-    
-    # Initialize detection pipeline components
-    source_dp = DP_MP4Source(config_dp.get("source.video_path"))
-    detector = YOLOBranchSeg(
-        model_path=config_dp.get("detector.model_path"),
-        conf=config_dp.get("detector.confidence_threshold")
-    )
-    tracker = ByteTrack(detector)
-    postprocessor = PostProcessor([
-        MaskExtraction(),
-        DistanceHeatmap(),
-        BitmaskSkeleton(),
-        CandidateScoring(),
-        CandidateVisualizer(),
-    ])
-    
-    # Create and run detection pipeline
-    pipeline_dp = DetectionPipeline(
-        source=source_dp,
-        detector=detector,
-        tracker=tracker,
-        postprocessor=postprocessor
-    )
-    
-    return pipeline_dp.run()
+
+    return iterator
 
 
 def main():
@@ -113,49 +77,62 @@ def main():
         point_focus_radius=config.get("feature_extraction.point_focus_radius"),
     )
 
+    tracker = KLTTracker(
+        feature_extractor=feature_extractor,
+        min_features=config.get("controller.min_features", 8),
+    )
+
     controller = PointController(
         gain=config.get("controller.main_gain", 0.5),
-        validation_enabled=config.get("controller.validation_enabled", True),
-        max_feature_motion_px=config.get("controller.max_feature_motion_px", 50.0),
-        fallback_enabled=config.get("controller.fallback_enabled", True),
-        fallback_gain_scale=config.get("controller.fallback_gain_scale", 0.5),
     )
 
     pipeline = IBVSPipeline(
         source=source,
         feature_extractor=feature_extractor,
-        controller=controller
-    
+        tracker=tracker,
+        controller=controller,
     )
 
-    frame_count = 0
-    for ctx in pipeline.run():
-        frame_count += 1
+    for frame_count, ctx in enumerate(pipeline.run(), 1):
+        ctrl = ctx.debug.get("controller", {})
         velocity = ctx.debug.get("velocity_command")
         error = ctx.debug.get("control_error_px")
-        point_source = ctx.debug.get("controller", {}).get("point_source", "none")
         print(
-            f"Frame {frame_count}: Extracted {len(ctx.extracted_features)} features, "
-            f"Point: {ctx.point}, Source: {point_source}, Error: {error}, cmd_vel: {velocity}"
+            f"Frame {frame_count}: tracked={ctrl.get('n_tracked', 0)}, "
+            f"source={ctrl.get('point_source', 'none')}, error={error}, vel={velocity}"
         )
 
-        # Visualization: draw extracted feature centers on the frame and display
-        try:
-            for (x, y) in ctx.extracted_features:
-                cv2.circle(ctx.frame, (int(x), int(y)), 4, (0, 255, 0), -1)
-            
-            # Draw point if available
-            if ctx.point is not None:
-                x, y = ctx.point
-                cv2.circle(ctx.frame, (int(x), int(y)), 6, (0, 0, 255), 2)
-            
-            cv2.imshow('IBVS - Features & Target Point', ctx.frame)
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                break
-        except Exception:
-            pass
+        vis = ctx.frame.copy()
+        h, w = vis.shape[:2]
+        center = (w // 2, h // 2)
 
-    # Cleanup
+        # Draw tracked features as green dots
+        if ctx.extracted_features is not None:
+            for (x, y) in ctx.extracted_features:
+                cv2.circle(vis, (int(x), int(y)), 4, (0, 255, 0), -1)
+
+        # Draw final_point anchor (blue) and KLT-estimated branch position (red)
+        if ctx.point is not None:
+            cv2.circle(vis, (int(ctx.point[0]), int(ctx.point[1])), 7, (255, 0, 0), 2)
+        if ctx.estimated_point is not None:
+            cv2.circle(vis, (int(ctx.estimated_point[0]), int(ctx.estimated_point[1])), 7, (0, 0, 255), 2)
+
+        # Draw frame center crosshair
+        cv2.drawMarker(vis, center, (200, 200, 200), cv2.MARKER_CROSS, 20, 1)
+
+        # Draw velocity arrow from frame center — direction and length show where/how hard to move
+        if velocity is not None and np.linalg.norm(velocity) > 0.5:
+            arrow_scale = 2.0  # px per unit velocity for display
+            tip = (
+                int(center[0] + velocity[0] * arrow_scale),
+                int(center[1] + velocity[1] * arrow_scale),
+            )
+            cv2.arrowedLine(vis, center, tip, (0, 165, 255), 2, tipLength=0.3)
+
+        cv2.imshow('IBVS', vis)
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
     source.release()
     cv2.destroyAllWindows()
 

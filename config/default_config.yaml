@@ -2,7 +2,7 @@
 
 # Source Configuration
 source:
-  type: "mp4"  # "mp4" or "detection"
+  type: "detection"  # "mp4" or "detection"
   video_path: "sources/apriltag_test.mp4"  # Path to video file
 
 # Feature Extraction Configuration (FAST + Harris)
@@ -12,5 +12,10 @@ feature_extraction:
   harris_block_size: 2
   harris_ksize: 3
   harris_k: 0.04
-  point_focus_radius: null  # Optional: focus on target point with this radius (pixels)
+  point_focus_radius: 80  # Applied only after warmup; filters features to branch region
+
+# Controller / Tracker
+controller:
+  main_gain: 0.5
+  min_features: 8  # Minimum tracked features before re-extracting
 
