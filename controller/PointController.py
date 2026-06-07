@@ -9,13 +9,14 @@ class PointController:
         h, w = ctx.frame.shape[:2]
         image_center = np.array([w / 2.0, h / 2.0], dtype=np.float32)
 
-        # Use KLT-estimated branch position if available, else fall back to detection point
+        # Post-lock: only use KLT-estimated point. Pre-lock: fall back to detection point.
         if ctx.estimated_point is not None:
             target = ctx.estimated_point
             point_source = "klt_centroid"
         elif ctx.point is not None:
+            # Still in warmup/pre-lock phase
             target = np.asarray(ctx.point, dtype=np.float32)
-            point_source = "detection"
+            point_source = "detection_prelocked"
         else:
             ctx.debug["control_error_px"] = None
             ctx.debug["velocity_command"] = np.zeros(2, dtype=np.float32)

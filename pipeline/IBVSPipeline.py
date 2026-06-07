@@ -19,36 +19,48 @@ class IBVSPipeline:
                 break
 
             ctx = IBVSContext(frame=frame)
-            if point is not None:
-                ctx.point = np.asarray(point, dtype=np.float32)
             ctx.reference_frame = getattr(self.source, "reference_frame", None)
             ctx.distance_mm = getattr(self.source, "distance_mm", None)
             ctx.warmup_complete = getattr(self.source, "warmup_complete", False)
 
-            # Step 1: extract FAST+Harris features (during warmup or on re-extraction)
-            try:
-                ctx.extracted_features = self.feature_extractor.extract(ctx)
-            except Exception as e:
-                logger.error(f"Feature extraction error: {e}", exc_info=True)
-                ctx.extracted_features = np.empty((0, 2), dtype=np.float32)
+            locked = self.tracker is not None and self.tracker._locked
 
-            # Step 2: KLT tracking — lock on first post-warmup frame, track afterwards
-            if self.tracker is not None and ctx.warmup_complete:
+            if not locked:
+                # Pre-lock: use detection point and extract features for visualization/locking
+                if point is not None:
+                    ctx.point = np.asarray(point, dtype=np.float32)
+
                 try:
-                    if not self.tracker._locked:
-                        # Lock using the reference frame captured when final_point was set
-                        ref = ctx.reference_frame if ctx.reference_frame is not None else ctx.frame
-                        if ctx.extracted_features is not None and len(ctx.extracted_features) >= self.tracker.min_features:
-                            self.tracker.lock(ref, ctx.extracted_features)
+                    ctx.extracted_features = self.feature_extractor.extract(ctx)
+                except Exception as e:
+                    logger.error(f"Feature extraction error: {e}", exc_info=True)
+                    ctx.extracted_features = np.empty((0, 2), dtype=np.float32)
 
-                    if self.tracker._locked:
-                        tracked = self.tracker.update(ctx.frame, ctx.point)
-                        ctx.extracted_features = tracked
-                        ctx.estimated_point = tracked.mean(axis=0).astype(np.float32) if len(tracked) > 0 else None
+                # Lock on the first post-warmup frame.
+                # Extract features from the reference frame so _prev_gray and _tracked_pts
+                # are consistent — KLT will then correctly track ref→current frame.
+                if self.tracker is not None and ctx.warmup_complete and ctx.point is not None:
+                    ref = ctx.reference_frame if ctx.reference_frame is not None else ctx.frame
+                    lock_ctx = IBVSContext(frame=ref)
+                    lock_ctx.point = ctx.point
+                    lock_ctx.warmup_complete = True
+                    try:
+                        lock_features = self.feature_extractor.extract(lock_ctx)
+                    except Exception as e:
+                        logger.error(f"Lock feature extraction error: {e}", exc_info=True)
+                        lock_features = np.empty((0, 2), dtype=np.float32)
+                    if lock_features is not None and len(lock_features) >= self.tracker.min_features:
+                        self.tracker.lock(ref, lock_features, ctx.point)
+                        logger.info("KLT tracker locked — switching to feature-only tracking")
+            else:
+                # Post-lock: tracker is sole authority, detection output is ignored entirely
+                try:
+                    tracked, ctx.estimated_point = self.tracker.update(ctx.frame)
+                    ctx.extracted_features = tracked
                 except Exception as e:
                     logger.error(f"Tracker error: {e}", exc_info=True)
 
-            # Step 3: controller computes error and velocity from estimated_point
+            # Controller computes error from estimated_point only (no detection fallback post-lock)
             if self.controller is not None:
                 try:
                     self.controller.update_ctx(ctx)
