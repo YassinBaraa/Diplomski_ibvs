@@ -29,11 +29,14 @@ class DetectionPipelineSource(FrameSource):
         if final_point is not None:
             self.warmup_complete = True
             point = np.array([final_point["x"], final_point["y"]], dtype=np.float32)
+            print(f"[DetectionPipelineSource] final_point={point}, dist={self.distance_mm} mm")
         elif isinstance(best_candidate, dict):
             x, y = best_candidate.get("x"), best_candidate.get("y")
             point = np.array([x, y], dtype=np.float32) if x is not None and y is not None else None
+            print(f"[DetectionPipelineSource] no final_point, best_candidate={point}, dist={self.distance_mm} mm")
         else:
             point = None
+            print(f"[DetectionPipelineSource] no point this frame, dist={self.distance_mm} mm")
 
         return True, frame, point
 
