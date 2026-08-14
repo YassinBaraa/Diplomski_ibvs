@@ -84,7 +84,9 @@ class KLTTracker:
 
         # Use the current centroid of tracked features directly as the branch position.
         # This is a direct measurement and doesn't accumulate drift over time.
-        estimated = new_centroid.copy() if len(good_2d) > 0 else None
+        # Internal tracking state (_last_centroid etc.) stays float32 for numerical
+        # accuracy; only the point handed to the rest of the pipeline is rounded to int.
+        estimated = np.round(new_centroid).astype(int) if len(good_2d) > 0 else None
 
         return good_2d, estimated
 

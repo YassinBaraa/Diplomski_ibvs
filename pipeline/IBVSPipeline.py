@@ -26,7 +26,6 @@ class IBVSPipeline:
             frame_n += 1
             ctx = IBVSContext(frame=frame)
             ctx.reference_frame = getattr(self.source, "reference_frame", None)
-            ctx.distance_mm = getattr(self.source, "distance_mm", None)
             ctx.warmup_complete = getattr(self.source, "warmup_complete", False)
 
             locked = self.tracker is not None and self.tracker._locked

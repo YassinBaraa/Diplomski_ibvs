@@ -133,10 +133,10 @@ def main():
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
 
+        target_point = ctx.estimated_point if ctx.estimated_point is not None else ctx.point
         yield {
-            "error_x": float(error[0]) if error is not None else None,
-            "error_y": float(error[1]) if error is not None else None,
-            "distance_mm": ctx.distance_mm,
+            "px": float(target_point[0]) if target_point is not None else None,
+            "py": float(target_point[1]) if target_point is not None else None,
         }
 
     source.release()

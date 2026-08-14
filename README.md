@@ -50,7 +50,8 @@ ibvs/
 ├── sources/
 │   ├── FrameSource.py
 │   ├── MP4Source.py
-│   └── DetectionPipelineSource.py   # Wraps detection_pipeline generator
+│   ├── DetectionPipelineSource.py   # Wraps detection_pipeline generator (branch mode)
+│   └── ArucoSource.py               # ArUco marker point source (aruco mode)
 ├── feature_extraction/
 │   ├── FASTHarrisExtractor.py       # FAST detection + Harris corner filtering
 │   ├── FeatureSelector.py           # Abstract interface
@@ -63,6 +64,32 @@ ibvs/
     ├── IBVSContext.py               # Per-frame data container
     └── IBVSPipeline.py              # Wires source, extractor, tracker, controller
 ```
+
+---
+
+## Detection Modes
+
+The perch/land point can come from either the branch segmentation pipeline
+(`DetectionPipelineSource`) or direct ArUco marker detection
+(`ArucoSource.py`). Both produce the same `(frame, point)` contract plus
+`reference_frame` / `warmup_complete`, so KLT tracking,
+feature extraction, and the controller are identical either way — switching
+modes is a one-line change of `DETECTION_MODE` in
+`UDP_client/pipeline_factory.py` (`"branch"` or `"aruco"`), shared by both
+`UDP_client/main.py` and `main_record.py`, not a code change here.
+
+ArUco is purely a detector choice — `ArucoSource` wraps whatever camera
+`pipeline_factory.py`'s `SOURCE_TYPE` selects (DSJ / Nicla / Pi camera / MP4). By
+default it tries every predefined ArUco dictionary during warmup and locks
+onto whichever one actually finds the tag — there's no way to tell which of
+the ~17 families a given printed/generated marker uses just by looking at it,
+and pinning the wrong one means silent, permanent non-detection. This only
+costs anything during warmup; detection stops entirely once locked. Set
+`ARUCO_DICTIONARY` to a specific name (e.g. `"DICT_4X4_50"`) once you know
+your tag's dictionary to skip the scan. It also doesn't filter by marker ID,
+since this is a single-tag perch/land setup, not multi-tag identification.
+Needs `cv2.aruco`, which requires **opencv-contrib-python** (plain
+`opencv-python` does not include it) — install it if using `"aruco"` mode.
 
 ---
 
@@ -94,7 +121,6 @@ After 5 consecutive frames with no `estimated_point`, the tracker unlocks and de
 | `extracted_features` | `np.ndarray [N,2]` | currently tracked feature positions |
 | `estimated_point` | `np.ndarray \| None` | KLT-estimated branch position |
 | `reference_frame` | `np.ndarray \| None` | frame when final_point was locked |
-| `distance_mm` | `float \| None` | ToF reading from detection pipeline |
 | `warmup_complete` | `bool` | whether detection pipeline warmup is done |
 | `debug` | `dict` | controller output, velocity command, control error |
 
