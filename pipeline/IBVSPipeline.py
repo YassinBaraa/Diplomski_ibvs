@@ -1,6 +1,7 @@
 from pipeline.IBVSContext import IBVSContext
 import logging
 import numpy as np
+import time
 
 logger = logging.getLogger(__name__)
 
@@ -8,17 +9,36 @@ _LOST_FRAMES_BEFORE_UNLOCK = 5  # consecutive frames with no estimated_point bef
 
 
 class IBVSPipeline:
-    def __init__(self, source, feature_extractor, tracker=None, controller=None):
+    def __init__(self, source, feature_extractor, tracker=None, controller=None, raw_source=None):
         self.source = source
         self.feature_extractor = feature_extractor
         self.tracker = tracker
         self.controller = controller
         self._lost_streak = 0
+        # Read frames straight from the camera while KLT is locked, instead of
+        # through `source` (branch mode's DetectionPipelineSource, backed by
+        # the full Hailo detect + mask/skeleton/scoring postprocessing chain).
+        # Once locked, that chain's output (final_point/best_candidate) is
+        # never read again -- only the raw frame is -- so running it anyway
+        # cost ~145ms/frame for nothing (measured: detect ~77ms + postprocess
+        # ~68ms out of a ~170ms frame). None for ArUco mode / no raw camera
+        # available, where `source` is already cheap and this optimization
+        # does not apply.
+        self.raw_source = raw_source
 
     def run(self):
         frame_n = 0
         while True:
-            ret, frame, point = self.source.read()
+            t_frame0 = time.monotonic()
+            locked = self.tracker is not None and self.tracker._locked
+            t_read0 = time.monotonic()
+            if locked and self.raw_source is not None:
+                read_result = self.raw_source.read()
+                ret, frame = read_result[0], read_result[1]
+                point = None
+            else:
+                ret, frame, point = self.source.read()
+            t_read1 = time.monotonic()
             if not ret or frame is None:
                 print("[IBVSPipeline] Source exhausted — stopping")
                 break
@@ -27,8 +47,6 @@ class IBVSPipeline:
             ctx = IBVSContext(frame=frame)
             ctx.reference_frame = getattr(self.source, "reference_frame", None)
             ctx.warmup_complete = getattr(self.source, "warmup_complete", False)
-
-            locked = self.tracker is not None and self.tracker._locked
 
             if not locked:
                 print(f"[IBVSPipeline] Frame {frame_n}: DETECTION mode — "
@@ -92,6 +110,7 @@ class IBVSPipeline:
                         self.tracker.unlock()
                         self._lost_streak = 0
 
+            t_ctrl0 = time.monotonic()
             if self.controller is not None:
                 try:
                     self.controller.update_ctx(ctx)
@@ -103,5 +122,12 @@ class IBVSPipeline:
                 except Exception as e:
                     logger.error(f"Controller error: {e}", exc_info=True)
                     ctx.debug["velocity_command"] = np.zeros(2, dtype=np.float32)
+            t_ctrl1 = time.monotonic()
+
+            print(f"[IBVSPipeline] Frame {frame_n}: TIMING — "
+                  f"source_read={1000*(t_read1-t_read0):.0f}ms "
+                  f"tracking_and_extraction={1000*(t_ctrl0-t_read1):.0f}ms "
+                  f"controller={1000*(t_ctrl1-t_ctrl0):.0f}ms "
+                  f"frame_total={1000*(t_ctrl1-t_frame0):.0f}ms")
 
             yield ctx

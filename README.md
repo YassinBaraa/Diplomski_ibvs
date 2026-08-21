@@ -79,14 +79,21 @@ modes is a one-line change of `DETECTION_MODE` in
 `UDP_client/main.py` and `main_record.py`, not a code change here.
 
 ArUco is purely a detector choice — `ArucoSource` wraps whatever camera
-`pipeline_factory.py`'s `SOURCE_TYPE` selects (DSJ / Nicla / Pi camera / MP4). By
-default it tries every predefined ArUco dictionary during warmup and locks
+`pipeline_factory.py`'s `SOURCE_TYPE` selects (DSJ / Nicla / Pi camera / MP4).
+Unlike branch mode, it has **no warmup**: it detects fresh every frame and
+IBVSPipeline locks KLT the instant a detection appears (branch mode's
+skeleton-based candidates are noisy and genuinely need the multi-frame
+clustering in `WarmupFinalPoint`; ArUco detection is essentially exact and
+false-positive-free, so there's nothing to average over).
+
+By default it tries every predefined ArUco dictionary each frame and locks
 onto whichever one actually finds the tag — there's no way to tell which of
 the ~17 families a given printed/generated marker uses just by looking at it,
-and pinning the wrong one means silent, permanent non-detection. This only
-costs anything during warmup; detection stops entirely once locked. Set
-`ARUCO_DICTIONARY` to a specific name (e.g. `"DICT_4X4_50"`) once you know
-your tag's dictionary to skip the scan. It also doesn't filter by marker ID,
+and pinning the wrong one means silent, permanent non-detection. Because
+detection now runs every frame forever (not bounded to a warmup window),
+this scan's cost is no longer bounded either — set `ARUCO_DICTIONARY` to a
+specific name (e.g. `"DICT_4X4_50"`) once you know your tag's dictionary to
+keep per-frame detection cheap. It also doesn't filter by marker ID,
 since this is a single-tag perch/land setup, not multi-tag identification.
 Needs `cv2.aruco`, which requires **opencv-contrib-python** (plain
 `opencv-python` does not include it) — install it if using `"aruco"` mode.

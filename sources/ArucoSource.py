@@ -1,12 +1,23 @@
 """ArUco-marker point source for the IBVS pipeline.
 
 Alternative to DetectionPipelineSource: instead of running the branch
-segmentation pipeline, it detects a known ArUco marker directly on each
+segmentation pipeline, it detects a known ArUco marker directly on every
 frame and exposes the same (frame, point) return value plus the
 reference_frame / warmup_complete attributes that
 DetectionPipelineSource already provides. IBVSPipeline reads only that
 contract, so KLT tracking / feature extraction / the controller are
 unaffected by which mode produced the point.
+
+Unlike branch mode's WarmupFinalPoint (which needs a multi-frame consensus
+because skeleton-based candidate scoring is noisy), ArUco detection is
+essentially exact and false-positive-free (checksum/ID-verified), so there
+is no warmup here: every frame is detected fresh and handed straight to
+IBVSPipeline, which locks KLT onto it the moment a detection appears.
+warmup_complete is always True -- it exists only so this class satisfies
+the same source contract as DetectionPipelineSource. reference_frame is
+always None for the same reason: IBVSPipeline already falls back to the
+current live frame when it is, which is exactly right here since the point
+returned each frame always matches that same frame's content.
 
 Deliberately has no imports from the `sources` or `pipeline` packages:
 ibvs/ and detection_pipeline/ each define top-level packages with those
@@ -20,17 +31,13 @@ currently active on sys.path.
 import cv2
 import numpy as np
 
-WARMUP_FRAMES = 50  # confirmed marker detections required before locking the perch point
-
 # "auto" tries every dictionary below per frame and uses whichever one actually
 # finds a marker. A generated/printed tag can come from any of these families
 # and there's no way to tell which from the image alone -- guessing wrong means
 # detectMarkers() silently returns zero detections forever, which is exactly
-# the "never locks" symptom this exists to avoid. This only costs anything
-# during warmup (see read()): once locked, detection stops running entirely,
-# so the multi-dictionary scan never runs during real-time flight.
-# Pass a specific name (e.g. "DICT_4X4_50") instead once you know your tag's
-# dictionary, to skip the scan and detect on every frame at minimal cost.
+# the "never locks" symptom this exists to avoid. Pass a specific name (e.g.
+# "DICT_4X4_50") instead once you know your tag's dictionary, to skip the scan
+# and detect on every frame at minimal cost.
 DEFAULT_DICTIONARY = "auto"
 
 _CANDIDATE_DICTIONARIES = [
@@ -73,20 +80,12 @@ def _make_marker_detector(dictionary_name):
 
 
 class ArucoSource:
-    def __init__(
-        self,
-        frame_source,
-        dictionary: str = DEFAULT_DICTIONARY,
-        warmup_frames: int = WARMUP_FRAMES,
-    ):
+    def __init__(self, frame_source, dictionary: str = DEFAULT_DICTIONARY):
         self.frame_source = frame_source
-        self.warmup_frames = warmup_frames
         self._detect = _make_marker_detector(dictionary)
 
-        self._candidate_history = []
-        self.warmup_complete = False
-        self._final_point = None
-        self.reference_frame = None
+        self.warmup_complete = True  # no warmup -- see module docstring
+        self.reference_frame = None  # always use the current live frame
 
     def _detect_center(self, frame):
         # Any marker from the configured dictionary counts -- this is a single-tag
@@ -104,23 +103,7 @@ class ArucoSource:
         if not ret or frame is None:
             return False, None, None
 
-        # Once locked, final_point/reference_frame are frozen forever (mirrors
-        # branch mode's WarmupFinalPoint) -- no need to keep detecting.
-        if self.warmup_complete:
-            return True, frame, self._final_point
-
         center = self._detect_center(frame)
-        if center is not None:
-            # keep full precision in the history for an accurate warmup average;
-            # only the point handed to the rest of the pipeline is rounded to int
-            self._candidate_history.append(center)
-            print(f"[ArucoSource] warmup {len(self._candidate_history)}/{self.warmup_frames}")
-        if len(self._candidate_history) >= self.warmup_frames:
-            self._final_point = np.round(np.mean(self._candidate_history, axis=0)).astype(int)
-            self.reference_frame = frame.copy()
-            self.warmup_complete = True
-            print(f"[ArucoSource] LOCKED final_point={self._final_point}")
-
         point = np.round(center).astype(int) if center is not None else None
         return True, frame, point
 
