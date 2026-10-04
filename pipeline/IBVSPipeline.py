@@ -5,34 +5,49 @@ import time
 
 logger = logging.getLogger(__name__)
 
-_LOST_FRAMES_BEFORE_UNLOCK = 5  # consecutive frames with no estimated_point before forcing re-lock
-
 
 class IBVSPipeline:
-    def __init__(self, source, feature_extractor, tracker=None, controller=None, raw_source=None):
+    """Detection -> candidate confirmation -> KLT tracking -> (loss) coast + recovery.
+
+    recovery (dict, all optional):
+      enabled            keep descriptors of the tracked target and search for it after a loss
+      coast_seconds      after a loss keep sending the last point, moving with its damped velocity,
+                         for this long (0 turns the coast off)
+      give_up_seconds    forget the lost target after this long and go back to plain detection
+      rebind_radius_px   a detection this close (grows with time lost) to the last point is
+                         taken to be the lost target
+    """
+
+    def __init__(self, source, feature_extractor, tracker=None, controller=None, raw_source=None,
+                 recovery=None):
         self.source = source
         self.feature_extractor = feature_extractor
         self.tracker = tracker
         self.controller = controller
-        self._lost_streak = 0
-        # Read frames straight from the camera while KLT is locked, instead of
+        rec = recovery or {}
+        self.recovery_enabled = bool(rec.get("enabled", True))
+        self.coast_seconds = float(rec.get("coast_seconds", 0.0))
+        self.give_up_seconds = float(rec.get("give_up_seconds", 5.0))
+        self.rebind_radius_px = float(rec.get("rebind_radius_px", 120.0))
+        self._lost_t0 = None
+        # Read frames straight from the camera while KLT is tracking, instead of
         # through `source` (branch mode's DetectionPipelineSource, backed by
         # the full Hailo detect + mask/skeleton/scoring postprocessing chain).
-        # Once locked, that chain's output (final_point/best_candidate) is
-        # never read again -- only the raw frame is -- so running it anyway
-        # cost ~145ms/frame for nothing (measured: detect ~77ms + postprocess
-        # ~68ms out of a ~170ms frame). None for ArUco mode / no raw camera
-        # available, where `source` is already cheap and this optimization
-        # does not apply.
+        # While tracking, that chain's output is never read -- only the raw frame
+        # is -- so running it anyway cost ~145ms/frame for nothing (measured:
+        # detect ~77ms + postprocess ~68ms out of a ~170ms frame). The chain runs
+        # again while idle or while looking for a lost target. None for ArUco
+        # mode / no raw camera available, where `source` is already cheap and
+        # this optimization does not apply.
         self.raw_source = raw_source
 
     def run(self):
         frame_n = 0
         while True:
             t_frame0 = time.monotonic()
-            locked = self.tracker is not None and self.tracker._locked
+            tracking = self.tracker is not None and self.tracker.state == "tracking"
             t_read0 = time.monotonic()
-            if locked and self.raw_source is not None:
+            if tracking and self.raw_source is not None:
                 read_result = self.raw_source.read()
                 ret, frame = read_result[0], read_result[1]
                 point = None
@@ -45,70 +60,17 @@ class IBVSPipeline:
 
             frame_n += 1
             ctx = IBVSContext(frame=frame)
-            ctx.reference_frame = getattr(self.source, "reference_frame", None)
-            ctx.warmup_complete = getattr(self.source, "warmup_complete", False)
+            ctx.extracted_features = np.empty((0, 2), dtype=np.float32)
 
-            if not locked:
-                print(f"[IBVSPipeline] Frame {frame_n}: DETECTION mode — "
-                      f"warmup={ctx.warmup_complete}, detection_point={point}")
-
-                if point is not None:
-                    ctx.point = np.asarray(point, dtype=np.float32)
-
+            if self.tracker is not None:
                 try:
-                    ctx.extracted_features = self.feature_extractor.extract(ctx)
-                    print(f"[IBVSPipeline] Frame {frame_n}: extracted {len(ctx.extracted_features)} features")
-                except Exception as e:
-                    logger.error(f"Feature extraction error: {e}", exc_info=True)
-                    ctx.extracted_features = np.empty((0, 2), dtype=np.float32)
-
-                if self.tracker is not None and ctx.warmup_complete and ctx.point is not None:
-                    ref = ctx.reference_frame if ctx.reference_frame is not None else ctx.frame
-                    lock_ctx = IBVSContext(frame=ref)
-                    lock_ctx.point = ctx.point
-                    lock_ctx.warmup_complete = True
-                    try:
-                        lock_features = self.feature_extractor.extract(lock_ctx)
-                        print(f"[IBVSPipeline] Frame {frame_n}: lock candidate — "
-                              f"{len(lock_features)} features around point {ctx.point}")
-                    except Exception as e:
-                        logger.error(f"Lock feature extraction error: {e}", exc_info=True)
-                        lock_features = np.empty((0, 2), dtype=np.float32)
-                    if lock_features is not None and len(lock_features) >= self.tracker.min_features:
-                        self.tracker.lock(ref, lock_features, ctx.point)
-                        self._lost_streak = 0
-                        print(f"[IBVSPipeline] Frame {frame_n}: LOCKED — switching to KLT tracking")
-                    else:
-                        print(f"[IBVSPipeline] Frame {frame_n}: not enough features to lock "
-                              f"({len(lock_features)} < {self.tracker.min_features}), waiting...")
-            else:
-                try:
-                    tracked, ctx.estimated_point = self.tracker.update(ctx.frame)
-                    ctx.extracted_features = tracked
-                    n_tracked = len(tracked) if tracked is not None else 0
-
-                    if ctx.estimated_point is not None:
-                        self._lost_streak = 0
-                        print(f"[IBVSPipeline] Frame {frame_n}: KLT tracking — "
-                              f"{n_tracked} features, estimated_point={ctx.estimated_point}")
-                    else:
-                        self._lost_streak += 1
-                        print(f"[IBVSPipeline] Frame {frame_n}: KLT lost point "
-                              f"(streak={self._lost_streak}/{_LOST_FRAMES_BEFORE_UNLOCK}), "
-                              f"tracked={n_tracked}")
-                        if self._lost_streak >= _LOST_FRAMES_BEFORE_UNLOCK:
-                            print(f"[IBVSPipeline] Frame {frame_n}: LOST STREAK reached — "
-                                  f"unlocking tracker, scanning for new final point")
-                            self.tracker.unlock()
-                            self._lost_streak = 0
-
+                    self._track(ctx, frame, point, frame_n)
                 except Exception as e:
                     logger.error(f"Tracker error: {e}", exc_info=True)
-                    self._lost_streak += 1
-                    if self._lost_streak >= _LOST_FRAMES_BEFORE_UNLOCK:
-                        print(f"[IBVSPipeline] Frame {frame_n}: tracker error streak — unlocking")
-                        self.tracker.unlock()
-                        self._lost_streak = 0
+                    self.tracker.unlock()
+                    self._lost_t0 = None
+            elif point is not None:
+                ctx.point = np.asarray(point, dtype=np.float32)
 
             t_ctrl0 = time.monotonic()
             if self.controller is not None:
@@ -131,3 +93,54 @@ class IBVSPipeline:
                   f"frame_total={1000*(t_ctrl1-t_frame0):.0f}ms")
 
             yield ctx
+
+    # Only estimated_point is ever sent (UDP):
+    #   idle      nothing sent (point = live candidate, for display only, not yet trusted)
+    #   tracking  estimated_point = the tracked perch point
+    #   lost      nothing sent unless coast_seconds > 0 (then the coasted point), or the point
+    #             once it is found again. An unrelated detection is never sent.
+    def _track(self, ctx, frame, point, frame_n):
+        tr = self.tracker
+        state = tr.state
+
+        if state == "tracking":
+            tracked, est = tr.update(frame)
+            ctx.extracted_features = tracked
+            if est is not None:
+                ctx.estimated_point = est
+                print(f"[IBVSPipeline] Frame {frame_n}: KLT tracking — {len(tracked)} features, point={est}")
+                return
+            if tr.state == "lost":
+                self._lost_t0 = time.monotonic()
+                print(f"[IBVSPipeline] Frame {frame_n}: target LOST — coasting/searching")
+                state = "lost"
+            else:
+                state = "idle"
+
+        if state == "lost":
+            elapsed = time.monotonic() - (self._lost_t0 or time.monotonic())
+            found = tr.recover(frame)
+            if not found and point is not None:
+                gate = self.rebind_radius_px * (1.0 + elapsed)
+                if np.linalg.norm(np.asarray(point, dtype=np.float32) - tr.last_point) <= gate:
+                    found = tr.lock_at(frame, point)
+            if found:
+                self._lost_t0 = None
+                ctx.estimated_point = np.round(tr.point).astype(int)
+                ctx.extracted_features = tr.points
+            elif elapsed > self.give_up_seconds:
+                print(f"[IBVSPipeline] Frame {frame_n}: lost for {elapsed:.1f}s — giving up, back to detection")
+                tr.unlock()
+                self._lost_t0 = None
+            elif self.coast_seconds > 0 and elapsed <= self.coast_seconds:
+                ctx.estimated_point = tr.coast()
+            return
+
+        # idle: detection mode
+        print(f"[IBVSPipeline] Frame {frame_n}: DETECTION mode — detection_point={point}")
+        if point is not None:
+            ctx.point = np.asarray(point, dtype=np.float32)
+        if tr.observe(frame, point):
+            ctx.estimated_point = np.round(tr.point).astype(int)
+            print(f"[IBVSPipeline] Frame {frame_n}: LOCKED — switching to KLT tracking")
+        ctx.extracted_features = tr.points

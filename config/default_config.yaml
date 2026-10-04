@@ -19,3 +19,12 @@ controller:
   main_gain: 0.5
   min_features: 8  # Minimum tracked features before re-extracting
 
+
+# Loss handling (IBVSPipeline). The tracked target keeps ORB descriptors of its surroundings,
+# so after a loss it can be found again without waiting for the detector.
+recovery:
+  enabled: true            # false = no descriptors/search, a lost target just drops back to detection
+  coast_seconds: 0         # 0 = send NOTHING while lost (controller falls into TAG_LOST, the safe state).
+                           # >0 = keep sending the last point, moving with its damped velocity, for this long.
+  give_up_seconds: 5.0     # forget the lost target after this long and go back to plain detection
+  rebind_radius_px: 120    # a detection this close (x(1 + seconds lost)) to the last point is the lost target

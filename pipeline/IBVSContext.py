@@ -7,7 +7,5 @@ class IBVSContext:
     frame: np.ndarray
     point: Optional[np.ndarray] = None
     extracted_features: Optional[np.ndarray] = None  # FAST+Harris keypoints [N,2]
-    reference_frame: Optional[np.ndarray] = None      # frame snapshot when final_point was locked
-    warmup_complete: bool = False
-    estimated_point: Optional[np.ndarray] = None      # KLT-estimated branch position this frame
+    estimated_point: Optional[np.ndarray] = None      # KLT-tracked perch point this frame (point = features + their stored offsets)
     debug: dict[str, Any] = field(default_factory=dict)

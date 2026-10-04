@@ -14,7 +14,7 @@ class PointController:
             target = ctx.estimated_point
             point_source = "klt_centroid"
         elif ctx.point is not None:
-            # Still in warmup/pre-lock phase
+            # Still pre-lock (candidate not confirmed yet)
             target = np.asarray(ctx.point, dtype=np.float32)
             point_source = "detection_prelocked"
         else:

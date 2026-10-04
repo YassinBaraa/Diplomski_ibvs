@@ -80,6 +80,7 @@ def main():
     tracker = KLTTracker(
         feature_extractor=feature_extractor,
         min_features=config.get("controller.min_features", 8),
+        recovery=config.get("recovery.enabled", True),
     )
 
     controller = PointController(
@@ -91,6 +92,7 @@ def main():
         feature_extractor=feature_extractor,
         tracker=tracker,
         controller=controller,
+        recovery=config.get_section("recovery"),
     )
 
     for frame_count, ctx in enumerate(pipeline.run(), 1):

@@ -2,22 +2,14 @@
 
 Alternative to DetectionPipelineSource: instead of running the branch
 segmentation pipeline, it detects a known ArUco marker directly on every
-frame and exposes the same (frame, point) return value plus the
-reference_frame / warmup_complete attributes that
-DetectionPipelineSource already provides. IBVSPipeline reads only that
-contract, so KLT tracking / feature extraction / the controller are
-unaffected by which mode produced the point.
+frame and exposes the same (frame, point) return value as
+DetectionPipelineSource. IBVSPipeline reads only that contract, so KLT
+tracking / feature extraction / the controller are unaffected by which mode
+produced the point.
 
-Unlike branch mode's WarmupFinalPoint (which needs a multi-frame consensus
-because skeleton-based candidate scoring is noisy), ArUco detection is
-essentially exact and false-positive-free (checksum/ID-verified), so there
-is no warmup here: every frame is detected fresh and handed straight to
-IBVSPipeline, which locks KLT onto it the moment a detection appears.
-warmup_complete is always True -- it exists only so this class satisfies
-the same source contract as DetectionPipelineSource. reference_frame is
-always None for the same reason: IBVSPipeline already falls back to the
-current live frame when it is, which is exactly right here since the point
-returned each frame always matches that same frame's content.
+ArUco detection is essentially exact and false-positive-free
+(checksum/ID-verified): every frame is detected fresh and handed straight to
+IBVSPipeline, which confirms the point over a few frames and locks KLT on it.
 
 Deliberately has no imports from the `sources` or `pipeline` packages:
 ibvs/ and detection_pipeline/ each define top-level packages with those
@@ -84,8 +76,6 @@ class ArucoSource:
         self.frame_source = frame_source
         self._detect = _make_marker_detector(dictionary)
 
-        self.warmup_complete = True  # no warmup -- see module docstring
-        self.reference_frame = None  # always use the current live frame
 
     def _detect_center(self, frame):
         # Any marker from the configured dictionary counts -- this is a single-tag
