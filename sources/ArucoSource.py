@@ -2,7 +2,7 @@
 
 Alternative to DetectionPipelineSource: instead of running the branch
 segmentation pipeline, it detects a known ArUco marker directly on every
-frame and exposes the same (frame, point) return value as
+frame and exposes the same (frame, point, info) return value as
 DetectionPipelineSource. IBVSPipeline reads only that contract, so KLT
 tracking / feature extraction / the controller are unaffected by which mode
 produced the point.
@@ -39,6 +39,20 @@ _CANDIDATE_DICTIONARIES = [
     "DICT_7X7_50", "DICT_7X7_100", "DICT_7X7_250", "DICT_7X7_1000",
     "DICT_ARUCO_ORIGINAL",
 ]
+
+# A marker with a corner this close to the image edge may be clipped: its size is left out.
+BORDER_MARGIN_PX = 3
+
+
+def _marker_size(c, frame_shape):
+    """Apparent size [px] of a marker = mean side length of its 4 corners (c: 4x2),
+    or None if a corner is within BORDER_MARGIN_PX of the image edge."""
+    h, w = frame_shape[:2]
+    x, y = c[:, 0], c[:, 1]
+    m = BORDER_MARGIN_PX
+    if x.min() < m or y.min() < m or x.max() > w - 1 - m or y.max() > h - 1 - m:
+        return None
+    return float(np.mean([np.linalg.norm(c[k] - c[(k + 1) % 4]) for k in range(4)]))
 
 
 def _make_single_detector(dictionary_name):
@@ -77,25 +91,30 @@ class ArucoSource:
         self._detect = _make_marker_detector(dictionary)
 
 
-    def _detect_center(self, frame):
+    def _detect_marker(self, frame):
+        """Returns (center, size) of the marker, or (None, None). size is None if the
+        marker touches the image edge."""
         # Any marker from the configured dictionary counts -- this is a single-tag
         # perch/land setup, not a multi-tag identification task, so there's no ID to match.
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         corners, ids = self._detect(gray)
         if ids is None or len(corners) == 0:
-            return None
-        return corners[0][0].mean(axis=0)
+            return None, None
+        c = corners[0][0]
+        return c.mean(axis=0), _marker_size(c, frame.shape)
 
     def read(self):
         read_result = self.frame_source.read()
         ret, frame = read_result[0], read_result[1]
 
         if not ret or frame is None:
-            return False, None, None
+            return False, None, None, {}
 
-        center = self._detect_center(frame)
+        # The camera's metadata (DSJSource: grab time) comes third
+        meta = read_result[2] if len(read_result) > 2 and isinstance(read_result[2], dict) else {}
+        center, size = self._detect_marker(frame)
         point = np.round(center).astype(int) if center is not None else None
-        return True, frame, point
+        return True, frame, point, {"t_frame": meta.get("t_frame"), "size": size}
 
     def release(self):
         self.frame_source.release()

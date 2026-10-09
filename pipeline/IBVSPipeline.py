@@ -5,6 +5,10 @@ import time
 
 logger = logging.getLogger(__name__)
 
+# A detection's size is sent with the tracked point only if the detection lies within its
+# own size (or this many px, the tracker's confirmation radius) of that point.
+SIZE_MATCH_MIN_PX = 40.0
+
 
 class IBVSPipeline:
     """Detection -> candidate confirmation -> KLT tracking -> (loss) coast + recovery.
@@ -51,15 +55,20 @@ class IBVSPipeline:
                 read_result = self.raw_source.read()
                 ret, frame = read_result[0], read_result[1]
                 point = None
+                # A raw camera's metadata (DSJSource: grab time) comes third
+                info = read_result[2] if len(read_result) > 2 and isinstance(read_result[2], dict) else {}
             else:
-                ret, frame, point = self.source.read()
+                read_result = self.source.read()
+                ret, frame, point = read_result[:3]
+                # Optional fourth value: {"t_frame": grab time, "size": detection's apparent size px}
+                info = read_result[3] if len(read_result) > 3 and read_result[3] else {}
             t_read1 = time.monotonic()
             if not ret or frame is None:
                 print("[IBVSPipeline] Source exhausted — stopping")
                 break
 
             frame_n += 1
-            ctx = IBVSContext(frame=frame)
+            ctx = IBVSContext(frame=frame, t_frame=info.get("t_frame"))
             ctx.extracted_features = np.empty((0, 2), dtype=np.float32)
 
             if self.tracker is not None:
@@ -71,6 +80,8 @@ class IBVSPipeline:
                     self._lost_t0 = None
             elif point is not None:
                 ctx.point = np.asarray(point, dtype=np.float32)
+
+            ctx.target_size = self._size_at_sent_point(ctx.estimated_point, point, info.get("size"))
 
             t_ctrl0 = time.monotonic()
             if self.controller is not None:
@@ -93,6 +104,17 @@ class IBVSPipeline:
                   f"frame_total={1000*(t_ctrl1-t_frame0):.0f}ms")
 
             yield ctx
+
+    @staticmethod
+    def _size_at_sent_point(estimated_point, point, size):
+        """This frame's detection size, but only if that detection is the target being sent.
+        The sent point is KLT-tracked or coasted, not the detection itself, so it may have
+        drifted off it -- a size that belongs to something else would corrupt the UAV's
+        time-to-contact. No detection this frame (e.g. KLT-only frames in branch mode) -> None."""
+        if estimated_point is None or point is None or not size:
+            return None
+        gap = np.linalg.norm(np.asarray(point, dtype=np.float32) - np.asarray(estimated_point, dtype=np.float32))
+        return size if gap <= max(size, SIZE_MATCH_MIN_PX) else None
 
     # Only estimated_point is ever sent (UDP):
     #   idle      nothing sent (point = live candidate, for display only, not yet trusted)
