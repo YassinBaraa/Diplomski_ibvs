@@ -5,9 +5,14 @@ import time
 
 logger = logging.getLogger(__name__)
 
-# A detection's size is sent with the tracked point only if the detection lies within its
-# own size (or this many px, the tracker's confirmation radius) of that point.
+# A detection counts as the tracked target only if it lies within its own size (or this many
+# px, the tracker's confirmation radius) of the tracked point: only then is its size sent with
+# that point, and with trust_detections a detection farther away re-locks the tracker.
 SIZE_MATCH_MIN_PX = 40.0
+
+
+def _match_gate(size):
+    return max(size or 0.0, SIZE_MATCH_MIN_PX)
 
 
 class IBVSPipeline:
@@ -20,14 +25,21 @@ class IBVSPipeline:
       give_up_seconds    forget the lost target after this long and go back to plain detection
       rebind_radius_px   a detection this close (grows with time lost) to the last point is
                          taken to be the lost target
+
+    trust_detections: the source's detections are the target itself (ArUco: ID-checked), so
+      the tracker locks on the first one, and re-locks on one that is away from the tracked
+      point. KLT only bridges the frames without a detection. In the 2026-10-09 flight the
+      tracker followed the ceiling beam for ~20 s while the tag was in view, because detections
+      were ignored during tracking.
     """
 
     def __init__(self, source, feature_extractor, tracker=None, controller=None, raw_source=None,
-                 recovery=None):
+                 recovery=None, trust_detections=False):
         self.source = source
         self.feature_extractor = feature_extractor
         self.tracker = tracker
         self.controller = controller
+        self.trust_detections = trust_detections
         rec = recovery or {}
         self.recovery_enabled = bool(rec.get("enabled", True))
         self.coast_seconds = float(rec.get("coast_seconds", 0.0))
@@ -74,7 +86,7 @@ class IBVSPipeline:
 
             if self.tracker is not None:
                 try:
-                    self._track(ctx, frame, point, frame_n)
+                    self._track(ctx, frame, point, frame_n, info)
                 except Exception as e:
                     logger.error(f"Tracker error: {e}", exc_info=True)
                     self.tracker.unlock()
@@ -126,7 +138,7 @@ class IBVSPipeline:
         if not size:
             return None, info.get("omit") or "no size measured"
         gap = float(np.linalg.norm(np.asarray(point, dtype=np.float32) - np.asarray(estimated_point, dtype=np.float32)))
-        gate = max(size, SIZE_MATCH_MIN_PX)
+        gate = _match_gate(size)
         if gap > gate:
             return None, f"detection {gap:.0f}px from the sent point (> {gate:.0f}px)"
         return size, None
@@ -136,7 +148,7 @@ class IBVSPipeline:
     #   tracking  estimated_point = the tracked perch point
     #   lost      nothing sent unless coast_seconds > 0 (then the coasted point), or the point
     #             once it is found again. An unrelated detection is never sent.
-    def _track(self, ctx, frame, point, frame_n):
+    def _track(self, ctx, frame, point, frame_n, info):
         tr = self.tracker
         state = tr.state
 
@@ -144,9 +156,14 @@ class IBVSPipeline:
             tracked, est = tr.update(frame)
             ctx.extracted_features = tracked
             if est is not None:
-                ctx.estimated_point = est
-                print(f"[IBVSPipeline] Frame {frame_n}: KLT tracking — {len(tracked)} features, point={est}")
-                return
+                gap = None if point is None else float(np.linalg.norm(np.asarray(point, dtype=np.float32) - est))
+                if not (self.trust_detections and gap is not None and gap > _match_gate(info.get("size_raw"))):
+                    ctx.estimated_point = est
+                    print(f"[IBVSPipeline] Frame {frame_n}: KLT tracking — {len(tracked)} features, point={est}")
+                    return
+                print(f"[IBVSPipeline] Frame {frame_n}: tracked point {gap:.0f}px off the detection — "
+                      f"re-locking on the detection")
+                tr.unlock()
             if tr.state == "lost":
                 self._lost_t0 = time.monotonic()
                 print(f"[IBVSPipeline] Frame {frame_n}: target LOST — coasting/searching")
@@ -177,7 +194,10 @@ class IBVSPipeline:
         print(f"[IBVSPipeline] Frame {frame_n}: DETECTION mode — detection_point={point}")
         if point is not None:
             ctx.point = np.asarray(point, dtype=np.float32)
-        if tr.observe(frame, point):
+        # A trusted detection is locked on at once; others are confirmed over a few frames first
+        locked = (point is not None and tr.lock_at(frame, point)) if self.trust_detections \
+            else tr.observe(frame, point)
+        if locked:
             ctx.estimated_point = np.round(tr.point).astype(int)
             print(f"[IBVSPipeline] Frame {frame_n}: LOCKED — switching to KLT tracking")
         ctx.extracted_features = tr.points
