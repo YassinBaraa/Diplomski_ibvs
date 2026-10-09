@@ -20,6 +20,8 @@ self-contained lets callers load it by file path (see
 UDP_client/main_record.py) regardless of which `sources` package is
 currently active on sys.path.
 """
+import time
+
 import cv2
 import numpy as np
 
@@ -43,16 +45,28 @@ _CANDIDATE_DICTIONARIES = [
 # A marker with a corner this close to the image edge may be clipped: its size is left out.
 BORDER_MARGIN_PX = 3
 
+# Backlit tag (bright ceiling behind it): its white is only ~90 gray and its black ~50, against
+# a ~220 ceiling, so ArUco's thresholding fuses the thin white margin with the bright background
+# and finds no square (2.8 % of frames detected in the 2026-10-09 recording). Brightening x3,
+# clipped at 255, makes margin and ceiling both white again (38 %).
+DETECTION_GAINS = (1.0, 3.0)
+# The two gains put the corners ~7 % apart, so the size must not alternate between them inside
+# the UAV's 1 s time-to-contact fit: the gain that found the marker last is kept, and the other
+# one is only tried once it has found nothing for this long.
+GAIN_SWITCH_S = 1.0
+
 
 def _marker_size(c, frame_shape):
-    """Apparent size [px] of a marker = mean side length of its 4 corners (c: 4x2),
-    or None if a corner is within BORDER_MARGIN_PX of the image edge."""
+    """(size, reason): size [px] = mean side length of the marker's 4 corners (c: 4x2), always
+    computed; reason says why it must not be sent (a corner within BORDER_MARGIN_PX of the
+    image edge), else None."""
     h, w = frame_shape[:2]
     x, y = c[:, 0], c[:, 1]
     m = BORDER_MARGIN_PX
+    size = float(np.mean([np.linalg.norm(c[k] - c[(k + 1) % 4]) for k in range(4)]))
     if x.min() < m or y.min() < m or x.max() > w - 1 - m or y.max() > h - 1 - m:
-        return None
-    return float(np.mean([np.linalg.norm(c[k] - c[(k + 1) % 4]) for k in range(4)]))
+        return size, f"marker within {m}px of the image edge"
+    return size, None
 
 
 def _make_single_detector(dictionary_name):
@@ -89,19 +103,26 @@ class ArucoSource:
     def __init__(self, frame_source, dictionary: str = DEFAULT_DICTIONARY):
         self.frame_source = frame_source
         self._detect = _make_marker_detector(dictionary)
+        self._gain = DETECTION_GAINS[0]  # gain that found the marker last
+        self._t_found = float("-inf")    # when it did
 
 
     def _detect_marker(self, frame):
-        """Returns (center, size) of the marker, or (None, None). size is None if the
-        marker touches the image edge."""
+        """Returns (corners 4x2, gain) of the marker, or (None, None)."""
         # Any marker from the configured dictionary counts -- this is a single-tag
         # perch/land setup, not a multi-tag identification task, so there's no ID to match.
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        corners, ids = self._detect(gray)
-        if ids is None or len(corners) == 0:
-            return None, None
-        c = corners[0][0]
-        return c.mean(axis=0), _marker_size(c, frame.shape)
+        now = time.monotonic()
+        gains = [self._gain]
+        if now - self._t_found > GAIN_SWITCH_S:
+            gains += [g for g in DETECTION_GAINS if g != self._gain]
+        for gain in gains:
+            img = gray if gain == 1.0 else cv2.convertScaleAbs(gray, alpha=gain)
+            corners, ids = self._detect(img)
+            if ids is not None and len(corners) > 0:
+                self._gain, self._t_found = gain, now
+                return corners[0][0], gain
+        return None, None
 
     def read(self):
         read_result = self.frame_source.read()
@@ -112,9 +133,14 @@ class ArucoSource:
 
         # The camera's metadata (DSJSource: grab time) comes third
         meta = read_result[2] if len(read_result) > 2 and isinstance(read_result[2], dict) else {}
-        center, size = self._detect_marker(frame)
-        point = np.round(center).astype(int) if center is not None else None
-        return True, frame, point, {"t_frame": meta.get("t_frame"), "size": size}
+        info = {"t_frame": meta.get("t_frame"), "size": None, "size_raw": None, "gain": None,
+                "omit": "no marker detected"}
+        c, gain = self._detect_marker(frame)
+        if c is None:
+            return True, frame, None, info
+        size, omit = _marker_size(c, frame.shape)
+        info.update(size=None if omit else size, size_raw=size, gain=gain, omit=omit)
+        return True, frame, np.round(c.mean(axis=0)).astype(int), info
 
     def release(self):
         self.frame_source.release()

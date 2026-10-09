@@ -57,6 +57,7 @@ class IBVSPipeline:
                 point = None
                 # A raw camera's metadata (DSJSource: grab time) comes third
                 info = read_result[2] if len(read_result) > 2 and isinstance(read_result[2], dict) else {}
+                info = {**info, "omit": "detector not run (KLT-only frame)"}
             else:
                 read_result = self.source.read()
                 ret, frame, point = read_result[:3]
@@ -81,7 +82,13 @@ class IBVSPipeline:
             elif point is not None:
                 ctx.point = np.asarray(point, dtype=np.float32)
 
-            ctx.target_size = self._size_at_sent_point(ctx.estimated_point, point, info.get("size"))
+            ctx.target_size, why = self._size_at_sent_point(ctx.estimated_point, point, info)
+            if ctx.estimated_point is not None:
+                raw = info.get("size_raw")
+                raw_txt = "-" if raw is None else f"{raw:.1f}"
+                result = f"sent {ctx.target_size:.1f}" if why is None else f"omitted: {why}"
+                print(f"[size] frame {frame_n}: detected={'yes' if point is not None else 'no'} "
+                      f"gain={info.get('gain') or '-'} raw={raw_txt} -> {result}")
 
             t_ctrl0 = time.monotonic()
             if self.controller is not None:
@@ -106,15 +113,23 @@ class IBVSPipeline:
             yield ctx
 
     @staticmethod
-    def _size_at_sent_point(estimated_point, point, size):
-        """This frame's detection size, but only if that detection is the target being sent.
-        The sent point is KLT-tracked or coasted, not the detection itself, so it may have
-        drifted off it -- a size that belongs to something else would corrupt the UAV's
-        time-to-contact. No detection this frame (e.g. KLT-only frames in branch mode) -> None."""
-        if estimated_point is None or point is None or not size:
-            return None
-        gap = np.linalg.norm(np.asarray(point, dtype=np.float32) - np.asarray(estimated_point, dtype=np.float32))
-        return size if gap <= max(size, SIZE_MATCH_MIN_PX) else None
+    def _size_at_sent_point(estimated_point, point, info):
+        """(size, reason): this frame's detection size, but only if that detection is the target
+        being sent; otherwise None and the reason. The sent point is KLT-tracked or coasted, not
+        the detection itself, so it may have drifted off it -- a size that belongs to something
+        else would corrupt the UAV's time-to-contact."""
+        if estimated_point is None:
+            return None, "no point sent"
+        if point is None:
+            return None, info.get("omit") or "no detection this frame"
+        size = info.get("size")
+        if not size:
+            return None, info.get("omit") or "no size measured"
+        gap = float(np.linalg.norm(np.asarray(point, dtype=np.float32) - np.asarray(estimated_point, dtype=np.float32)))
+        gate = max(size, SIZE_MATCH_MIN_PX)
+        if gap > gate:
+            return None, f"detection {gap:.0f}px from the sent point (> {gate:.0f}px)"
+        return size, None
 
     # Only estimated_point is ever sent (UDP):
     #   idle      nothing sent (point = live candidate, for display only, not yet trusted)
