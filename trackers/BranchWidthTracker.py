@@ -25,6 +25,11 @@ MIN_CONTRAST = 6.0     # gray levels between the branch and the background on ea
 # reached ~18 %/frame in a hand-held 2026-10-08 clip (a few % in a slow climb); blurred frames
 # there jumped +42 % for 2 frames and back.
 JUMP = 1.3
+# The first width is not checked against the mask's: a thin stick came out 14.8 px in the mask
+# and 5.4 px (steady) on its edges in the 2026-10-11 flight. It is taken once two consecutive
+# frames agree within this.
+CONFIRM_AGREE = 0.15
+MIN_SPACING_PX = 6.0   # cross-sections at least this far apart, so one crossing wire or knot can't spoil most
 
 _SMOOTH = cv2.getGaussianKernel(9, 1.0 / STEP).T  # 1 px sigma along each cross-section
 
@@ -61,6 +66,7 @@ class BranchWidthTracker:
         self._width = None        # last accepted width, px (before the first: the mask's rough width)
         self._dark = True         # branch darker than its background
         self._confirmed = False   # _width was measured on the edges, not only taken from the mask
+        self._pending = None      # unconfirmed width of the previous frame
         self._missed = 0          # frames since the last accepted width
         self.last_edges = []      # [(left_xy, right_xy)] found on the last measured frame, for drawing
 
@@ -83,7 +89,7 @@ class BranchWidthTracker:
         self._dir = d / np.linalg.norm(d)
         # no width at the point (not on the skeleton): mask area / length across the window
         self._width = float(width_hint) if width_hint else len(xs) / (2.0 * r)
-        self._confirmed, self._missed, self.seeded = False, 0, True
+        self._confirmed, self._pending, self._missed, self.seeded = False, None, 0, True
         return True
 
     def measure(self, frame, point):
@@ -96,7 +102,7 @@ class BranchWidthTracker:
         c = np.asarray(point, dtype=np.float64)
 
         # Sample points: N_PROFILES cross-sections along the branch, each +-(1.5 widths + 6 px)
-        spacing = float(np.clip(0.5 * w_prev, 3.0, 20.0))
+        spacing = float(np.clip(0.5 * w_prev, MIN_SPACING_PX, 20.0))
         ts = (np.arange(N_PROFILES) - (N_PROFILES - 1) / 2.0) * spacing
         ss = np.arange(-(1.5 * w_prev + 6.0), 1.5 * w_prev + 6.0 + STEP / 2, STEP)
         X = c[0] + ts[:, None] * d[0] + ss[None, :] * n[0]
@@ -117,7 +123,7 @@ class BranchWidthTracker:
         g = np.gradient(prof, axis=1) / STEP          # gray levels per px, along +n
         if not self._dark:
             g = -g                                    # entering the branch is always a fall
-        lo_p, hi_p = (0.4, 2.5) if self._confirmed else (0.33, 3.0)
+        lo_p, hi_p = (0.4, 2.5) if self._confirmed else (0.2, 3.0)
 
         widths, axis_pts, self.last_edges = [], [], []
         for k, t in zip(np.flatnonzero(inside), range(int(inside.sum()))):
@@ -177,11 +183,17 @@ class BranchWidthTracker:
         if raw < MIN_WIDTH_PX:
             self._missed += 1
             return None, f"branch narrower than {MIN_WIDTH_PX:.0f}px", raw
-        k = 1.0 + self._missed / 10.0
-        lo, hi = ((1.0 / JUMP) ** k, JUMP ** k) if self._confirmed else (0.5, 2.0)
-        if not lo <= raw / w_prev <= hi:
-            self._missed += 1
-            return None, f"width jumped {w_prev:.1f} -> {raw:.1f}px", raw
+        if not self._confirmed:
+            # The next search works at this scale; the width is sent once the next frame agrees
+            pending, self._pending, self._width = self._pending, raw, raw
+            if pending is None or abs(raw / pending - 1.0) > CONFIRM_AGREE:
+                self._missed += 1
+                return None, "first width not confirmed yet (needs 2 agreeing frames)", raw
+        else:
+            k = 1.0 + self._missed / 10.0
+            if not (1.0 / JUMP) ** k <= raw / w_prev <= JUMP ** k:
+                self._missed += 1
+                return None, f"width jumped {w_prev:.1f} -> {raw:.1f}px", raw
 
         self._width, self._dir, self._confirmed, self._missed = raw, d_new / np.linalg.norm(d_new), True, 0
         return raw, None, raw
