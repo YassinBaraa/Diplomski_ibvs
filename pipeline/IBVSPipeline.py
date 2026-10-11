@@ -31,15 +31,21 @@ class IBVSPipeline:
       point. KLT only bridges the frames without a detection. In the 2026-10-09 flight the
       tracker followed the ceiling beam for ~20 s while the tag was in view, because detections
       were ignored during tracking.
+
+    size_tracker: measures the sent size itself on every tracking frame (branch mode:
+      BranchWidthTracker), instead of taking it from the detection, which only exists while
+      searching. It is seeded from the detection's mask when the tracker locks and forgotten
+      when the tracker goes back to detection.
     """
 
     def __init__(self, source, feature_extractor, tracker=None, controller=None, raw_source=None,
-                 recovery=None, trust_detections=False):
+                 recovery=None, trust_detections=False, size_tracker=None):
         self.source = source
         self.feature_extractor = feature_extractor
         self.tracker = tracker
         self.controller = controller
         self.trust_detections = trust_detections
+        self.size_tracker = size_tracker
         rec = recovery or {}
         self.recovery_enabled = bool(rec.get("enabled", True))
         self.coast_seconds = float(rec.get("coast_seconds", 0.0))
@@ -84,6 +90,7 @@ class IBVSPipeline:
             ctx = IBVSContext(frame=frame, t_frame=info.get("t_frame"))
             ctx.extracted_features = np.empty((0, 2), dtype=np.float32)
 
+            was_tracking = self.tracker is not None and self.tracker.state == "tracking"
             if self.tracker is not None:
                 try:
                     self._track(ctx, frame, point, frame_n, info)
@@ -94,9 +101,12 @@ class IBVSPipeline:
             elif point is not None:
                 ctx.point = np.asarray(point, dtype=np.float32)
 
-            ctx.target_size, why = self._size_at_sent_point(ctx.estimated_point, point, info)
-            if ctx.estimated_point is not None:
+            if self.size_tracker is not None and self.tracker is not None:
+                ctx.target_size, why, raw = self._tracked_size(ctx, frame, point, info, was_tracking)
+            else:
+                ctx.target_size, why = self._size_at_sent_point(ctx.estimated_point, point, info)
                 raw = info.get("size_raw")
+            if ctx.estimated_point is not None:
                 raw_txt = "-" if raw is None else f"{raw:.1f}"
                 result = f"sent {ctx.target_size:.1f}" if why is None else f"omitted: {why}"
                 print(f"[size] frame {frame_n}: detected={'yes' if point is not None else 'no'} "
@@ -123,6 +133,23 @@ class IBVSPipeline:
                   f"frame_total={1000*(t_ctrl1-t_frame0):.0f}ms")
 
             yield ctx
+
+    def _tracked_size(self, ctx, frame, point, info, was_tracking):
+        """(size, reason, raw) from size_tracker, measured at the sent point on this frame."""
+        st, state = self.size_tracker, self.tracker.state
+        if state == "idle":
+            st.reset()
+        if state != "tracking" or ctx.estimated_point is None:
+            return None, "no point sent" if ctx.estimated_point is None else "target lost", None
+        # (Re)locked on this frame, or not seeded yet: learn the target from this frame's detection
+        # mask, if that detection is the target. A lost target found again without a detection
+        # keeps the previous seed.
+        mask = info.get("mask")
+        if (not was_tracking or not st.seeded) and mask is not None and point is not None and \
+                np.linalg.norm(np.asarray(point, dtype=np.float32) - ctx.estimated_point) \
+                <= _match_gate(info.get("size_raw")):
+            st.seed(frame, ctx.estimated_point, mask, info.get("size_raw"))
+        return st.measure(frame, ctx.estimated_point)
 
     @staticmethod
     def _size_at_sent_point(estimated_point, point, info):

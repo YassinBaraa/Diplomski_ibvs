@@ -44,7 +44,8 @@ class DetectionPipelineSource(FrameSource):
             point = np.array([round(x), round(y)], dtype=int) if x is not None and y is not None else None
             if point is not None:
                 width, omit = _branch_width(best_candidate, frame.shape)
-                info.update(size=None if omit else width, size_raw=width, omit=omit)
+                # mask of the candidate's branch: seeds the per-frame width measurement at lock
+                info.update(size=None if omit else width, size_raw=width, omit=omit, mask=data.get("mask"))
             print(f"[DetectionPipelineSource] best_candidate={point} width={info['size_raw']}")
         else:
             point = None
