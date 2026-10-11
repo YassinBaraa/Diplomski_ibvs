@@ -27,6 +27,12 @@ _MIN_MATCHES = 6
 _VOTE_INLIER_PX = 15       # votes (keypoint - stored offset) within this of the median are inliers
 _COAST_DAMPING = 0.7       # per-frame shrink of the coasted velocity
 
+# Offsets follow the target's scale and rotation (similarity fit of the survivors' motion).
+# Without this the point slid toward the side with fewer features as the target grew: in the
+# 2026-10-11 ArUco approach it ended up half a tag width (126 px) off the tag centre.
+_SIM_INLIER_PX = 2.0       # RANSAC reprojection threshold of the similarity fit
+_SIM_MAX_STEP = 1.25       # a per-frame scale change beyond this (or its inverse) is a bad fit
+
 
 class KLTTracker:
     """KLT tracker whose output is the perch POINT, not the feature centroid.
@@ -180,6 +186,20 @@ class KLTTracker:
 
     # ------------------------------------------------------------- tracking
 
+    @staticmethod
+    def _similarity(prev_pts, next_pts):
+        """2x2 scale+rotation of the features from prev_pts to next_pts (RANSAC, so features that
+        moved on their own don't count); identity if it can't be estimated reliably."""
+        if len(prev_pts) < _MIN_VOTE_FEATURES:
+            return np.eye(2, dtype=np.float32)
+        M, inl = cv2.estimateAffinePartial2D(prev_pts.reshape(-1, 2), next_pts.reshape(-1, 2),
+                                             method=cv2.RANSAC, ransacReprojThreshold=_SIM_INLIER_PX)
+        if M is None or inl is None or inl.sum() < _MIN_VOTE_FEATURES:
+            return np.eye(2, dtype=np.float32)
+        A = M[:, :2].astype(np.float32)
+        scale = float(np.sqrt(abs(np.linalg.det(A))))
+        return A if 1.0 / _SIM_MAX_STEP <= scale <= _SIM_MAX_STEP else np.eye(2, dtype=np.float32)
+
     def update(self, frame):
         """Returns (tracked_features[N,2], point_or_None). None means the target was lost."""
         curr_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -197,7 +217,8 @@ class KLTTracker:
             self._lose()
             return np.empty((0, 2), dtype=np.float32), None
 
-        # Each survivor votes for the point through its stored offset
+        # Scale/rotate the stored offsets with the target, then each survivor votes for the point
+        offsets = offsets @ self._similarity(self._tracked_pts[ok], pts).T
         est = np.median(pts.reshape(-1, 2) - offsets, axis=0).astype(np.float32)
 
         min_required = max(self.min_features, int(n_prev * MIN_SURVIVAL_RATIO))
