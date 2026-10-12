@@ -1,5 +1,6 @@
 from pipeline.IBVSContext import IBVSContext
-from trackers.TargetModel import MIN_INLIERS, branch_strip
+from trackers.TargetModel import MIN_INLIERS, CROSS_MARGIN, CROSS_MARGIN_PX, branch_strip, crossing_spans
+import cv2
 import logging
 import numpy as np
 import time
@@ -30,7 +31,8 @@ VIEW_AFTER_CHECKS = 3    # agreeing checks in a row (since the last re-find / pu
 def _view_region(shape, point, direction, width):
     """Where a TargetModel view takes its keypoints: a strip along the branch, +-10 widths along it
     and +-2 across. In 2026-10-12 replays a wider strip (+-6 across) matched background and put
-    the point off the branch, a longer one (+-30 along) stopped matching after the first loss."""
+    the point off the branch, a longer one (+-30 along) stopped matching after the first loss.
+    (Leaving out the crossings, as for the KLT features, left too few keypoints to find it again.)"""
     return branch_strip(shape, point, direction, width)
 
 
@@ -76,11 +78,17 @@ class IBVSPipeline:
         self._strip_done = False   # features moved onto the branch strip since the last lock
         self._pending_snap = None  # offset to the stored target seen at the last check, awaiting a 2nd
         self._capture_wait = 0     # frames until the next try to store the target
+        # for the overlay: this frame's events (LOCKED, LOST, PUT BACK, ...) and where the stored
+        # target was last seen relative to the tracked point
+        self._events = []
+        self.model_offset, self.model_seen_t = None, None
         self._agree = 0            # checks in a row that agreed with the stored target
+        self._since_cleanup = 0    # tracking frames since tracked features were last checked for crossings
         self._last_width = None    # branch width while last tracked, and when (for re-finds)
         self._last_width_t = None
         if tracker is not None and size_tracker is not None:
             tracker.feature_region = self._branch_region
+            tracker.feature_filter = self._avoid_crossings
         rec = recovery or {}
         self.recovery_enabled = bool(rec.get("enabled", True))
         self.coast_seconds = float(rec.get("coast_seconds", 0.0))
@@ -170,7 +178,11 @@ class IBVSPipeline:
                   f"controller={1000*(t_ctrl1-t_ctrl0):.0f}ms "
                   f"frame_total={1000*(t_ctrl1-t_frame0):.0f}ms")
 
+            ctx.debug["events"], self._events = self._events, []
             yield ctx
+
+    def _event(self, name, detail=""):
+        self._events.append((name, detail))
 
     def reset_target(self):
         """Operator reset ('r'): forget the target; the next confirmed detection becomes the new one."""
@@ -182,6 +194,8 @@ class IBVSPipeline:
             self.size_tracker.reset()
         self._lost_t0, self._strip_done, self._since_check, self._pending_snap = None, False, 0, None
         self._agree, self._last_width, self._last_width_t = 0, None, None
+        self.model_offset = None
+        self._event("RESET", "target dropped")
 
     def _branch_region(self, shape, point):
         """Where new KLT features may come from: a strip along the tracked branch, so they move with
@@ -191,6 +205,49 @@ class IBVSPipeline:
             return None
         w = st.width
         return branch_strip(shape, point, st.direction, w, half_len=max(10.0 * w, 100.0), half_wid=max(1.5 * w, 6.0))
+
+    def _bad_features(self, frame, point, pts):
+        """[N] bool: features where a background line crosses behind the branch, or off the branch
+        strip. Crossings give the strongest corners near the point, but slide along the branch as the
+        UAV moves (16:11 and 17:13 flights: the point slid 70-200 px with them). None if unknown."""
+        st = self.size_tracker
+        if not st.seeded or not st.width or not len(pts):
+            return None
+        w = st.width
+        d = np.asarray(st.direction, dtype=np.float32)
+        d = d / max(float(np.linalg.norm(d)), 1e-6)
+        rel = np.asarray(pts, dtype=np.float32).reshape(-1, 2) - np.asarray(point, dtype=np.float32)
+        t, across = rel @ d, np.abs(rel @ np.array([-d[1], d[0]], dtype=np.float32))
+        bad = (across > max(1.5 * w, 6.0)) | (np.abs(t) > max(10.0 * w, 100.0))
+        m = max(CROSS_MARGIN * w, CROSS_MARGIN_PX)
+        for t0, t1 in crossing_spans(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), point, d, w, max(10.0 * w, 100.0)):
+            bad |= (t >= t0 - m) & (t <= t1 + m)
+        return bad
+
+    def _avoid_crossings(self, frame, point, pts):
+        """KLT feature_filter: new features minus bad ones (_bad_features), unless too few remain."""
+        bad = self._bad_features(frame, point, pts)
+        if bad is None or (~bad).sum() < self.tracker.min_features:
+            return pts
+        return pts[~bad]
+
+    def _clean_features(self, frame):
+        """Every MODEL_CHECK_EVERY tracking frames: drop tracked features that drifted onto a crossing
+        or off the branch; when that leaves fewer than twice the minimum, take fresh ones (point kept).
+        Not every frame, and never down to the bare minimum: both made the loop 2x slower and lost the
+        target close to the branch (17:36 flight)."""
+        tr = self.tracker
+        self._since_cleanup += 1
+        if self._since_cleanup < MODEL_CHECK_EVERY:
+            return
+        self._since_cleanup = 0
+        bad = self._bad_features(frame, tr.point, tr.points)
+        if bad is None or not bad.any():
+            return
+        if (~bad).sum() >= 2 * tr.min_features:
+            tr.keep_features(~bad)
+        else:
+            tr.refresh_features(frame)
 
     def _tracked_size(self, ctx, frame, point, info, was_tracking):
         """(size, reason, raw) from size_tracker, measured at the sent point on this frame."""
@@ -226,6 +283,9 @@ class IBVSPipeline:
             self._strip_done = tr.refresh_features(frame)
             if self._strip_done:
                 ctx.extracted_features = tr.points
+        else:
+            self._clean_features(frame)
+            ctx.extracted_features = tr.points
         if self.target_model is not None and not self.target_model.active:
             self._capture_wait -= 1
             if self._capture_wait <= 0:
@@ -233,6 +293,7 @@ class IBVSPipeline:
                 w, d, p = st.width, st.direction, tr.point
                 if self.target_model.add_view(frame, p, d, w, _view_region(frame.shape, p, d, w)):
                     print(f"[IBVSPipeline] Target stored at {np.round(p).astype(int)} (width {w:.1f}px)")
+                    self._event("TARGET STORED", f"{w:.1f} px")
 
     def _check_against_model(self, ctx, frame, frame_n):
         """Every MODEL_CHECK_EVERY tracking frames: find the stored target near the KLT point. Off by
@@ -258,14 +319,30 @@ class IBVSPipeline:
         offset = res["point"] - est
         gap, tol = float(np.linalg.norm(offset)), max(w, MIN_SNAP_PX)
         if gap > tol:
-            confirmed = self._pending_snap is not None and float(np.linalg.norm(offset - self._pending_snap)) <= tol
+            # Only a strong, unambiguous, same-scale match may move the point: in the 2026-10-12 16:11 flight two
+            # corrections from 7 matches moved it and turned the width measurement along the stick
+            # (size then stayed off for 100-170 frames). A rejected one also clears a half-confirmed one.
+            if res["inliers"] < REFIND_MIN_INLIERS or res["ambiguous"] or \
+                    (st.confirmed and max(res["width"] / st.width, st.width / res["width"]) > REFIND_SCALE):
+                self._pending_snap = None
+                return
+            self.model_offset, self.model_seen_t = offset, time.monotonic()
+            # The second offset may differ by half the first: a point sliding along the stick (KLT
+            # features slide along its edges) changes the offset every check, and was never put back
+            # (16:11 flight: 70-130 px below the stored spot for seconds).
+            prev = self._pending_snap
+            confirmed = prev is not None and \
+                float(np.linalg.norm(offset - prev)) <= max(tol, 0.5 * float(np.linalg.norm(prev)))
             self._pending_snap = offset
             if not confirmed:
                 return
             self._pending_snap, self._agree = None, 0
             print(f"[IBVSPipeline] Frame {frame_n}: point {gap:.0f}px off the stored target "
                   f"({res['inliers']} matches) — put back")
-            st.expect(res["direction"], res["width"])
+            self._event("PUT BACK", f"{gap:.0f} px · {res['inliers']} matches")
+            self.model_offset = np.zeros(2, dtype=np.float32)
+            if not st.confirmed:   # otherwise keep the measured direction and width: only the position is corrected
+                st.expect(res["direction"], res["width"])
             tr.unlock()
             if tr.lock_at(frame, res["point"]):
                 ctx.estimated_point = np.round(tr.point).astype(int)
@@ -274,12 +351,14 @@ class IBVSPipeline:
             else:
                 ctx.estimated_point = None   # searched for again from the next frame
             return
+        self.model_offset, self.model_seen_t = offset, time.monotonic()
         self._pending_snap = None
         self._agree += 1
         d, wv = (st.direction, st.width) if st.confirmed else (res["direction"], res["width"])
         if self._agree >= VIEW_AFTER_CHECKS and tm.needs_view(wv) and \
                 tm.add_view(frame, res["point"], d, wv, _view_region(frame.shape, res["point"], d, wv)):
             print(f"[IBVSPipeline] Frame {frame_n}: target view added at width {wv:.1f}px ({len(tm.views)} views)")
+            self._event("VIEW ADDED", f"{wv:.1f} px · {len(tm.views)} views")
 
     def _reacquire(self, ctx, frame, point, info, frame_n):
         """Target lost but stored: look only for the stored target. The detector merely confirms
@@ -306,6 +385,8 @@ class IBVSPipeline:
             self._strip_done, self._since_check, self._pending_snap, self._agree = True, 0, None, 0
             print(f"[IBVSPipeline] Frame {frame_n}: stored target found again "
                   f"({res['inliers']} matches, x{res['scale']:.2f}) — tracking")
+            self._event("RE-FOUND", f"{res['inliers']} matches")
+            self.model_offset, self.model_seen_t = np.zeros(2, dtype=np.float32), time.monotonic()
 
     @staticmethod
     def _on_a_branch(res, info, shape):
@@ -360,14 +441,18 @@ class IBVSPipeline:
                     return
                 print(f"[IBVSPipeline] Frame {frame_n}: tracked point {gap:.0f}px off the detection — "
                       f"re-locking on the detection")
+                self._event("RE-LOCKED", f"{gap:.0f} px off the detection")
                 tr.unlock()
             if tr.state == "lost":
                 self._lost_t0 = time.monotonic()
                 print(f"[IBVSPipeline] Frame {frame_n}: target LOST — coasting/searching")
+                self._event("LOST")
                 state = "lost"
             else:
                 if est is None and self.target_model is not None and self.target_model.active:
                     print(f"[IBVSPipeline] Frame {frame_n}: target LOST — searching for the stored target")
+                    self._event("LOST", "searching for the stored target")
+                    self.model_offset = None
                 state = "idle"
 
         if state == "lost":
@@ -383,6 +468,7 @@ class IBVSPipeline:
                 ctx.extracted_features = tr.points
             elif elapsed > self.give_up_seconds:
                 print(f"[IBVSPipeline] Frame {frame_n}: lost for {elapsed:.1f}s — giving up, back to detection")
+                self._event("GAVE UP", f"lost {elapsed:.1f} s")
                 tr.unlock()
                 self._lost_t0 = None
             elif self.coast_seconds > 0 and elapsed <= self.coast_seconds:
@@ -403,4 +489,5 @@ class IBVSPipeline:
             ctx.estimated_point = np.round(tr.point).astype(int)
             self._strip_done, self._since_check, self._capture_wait = False, 0, 0
             print(f"[IBVSPipeline] Frame {frame_n}: LOCKED — switching to KLT tracking")
+            self._event("LOCKED")
         ctx.extracted_features = tr.points

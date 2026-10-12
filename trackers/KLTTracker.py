@@ -56,6 +56,9 @@ class KLTTracker:
         # Optional callable(frame_shape, point) -> uint8 mask (nonzero = allowed) for new features,
         # e.g. a strip along the tracked branch; None = anywhere near the point
         self.feature_region = None
+        # Optional callable(frame, point, pts[N,2]) -> pts: drops unwanted new features (e.g. on a
+        # background line crossing the branch); runs once per extraction, not every frame
+        self.feature_filter = None
 
         self._orb = cv2.ORB_create(nfeatures=1000) if self.recovery else None
         self._matcher = cv2.BFMatcher(cv2.NORM_HAMMING) if self.recovery else None
@@ -119,7 +122,10 @@ class KLTTracker:
         if mask is not None and len(new_pts) < self.min_features:
             # too little texture in the region: take features from anywhere near the point
             new_pts = self.feature_extractor.extract(types.SimpleNamespace(frame=frame, point=point, mask=None))
-        return new_pts.reshape(-1, 2).astype(np.float32)
+        new_pts = new_pts.reshape(-1, 2).astype(np.float32)
+        if self.feature_filter is not None and len(new_pts):
+            new_pts = self.feature_filter(frame, point, new_pts)
+        return new_pts
 
     def _make_reference(self, gray, point):
         """Store ORB descriptors around the point, with each keypoint's offset to it."""
@@ -195,6 +201,12 @@ class KLTTracker:
         self._offsets = (pts - self._point).astype(np.float32)
         self._prev_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         return True
+
+    def keep_features(self, keep):
+        """Drop the tracked features where `keep` is False; the point stays."""
+        keep = np.asarray(keep, dtype=bool).reshape(-1)
+        self._tracked_pts = self._tracked_pts[keep]
+        self._offsets = self._offsets[keep]
 
     def shift(self, delta):
         """Move the tracked point by delta (px) without touching the features."""
