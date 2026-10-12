@@ -26,6 +26,14 @@ MIN_SNAP_PX = 8.0        # the KLT point is put back on the stored target when o
 REFIND_MIN_INLIERS = 10
 REFIND_SCALE = 1.6
 VIEW_AFTER_CHECKS = 3    # agreeing checks in a row (since the last re-find / put-back) before adding a view
+# Branch mode locks only on a detection at least this far inside the image: in the 2026-10-12 17:44
+# flight three locks sat at the top edge (y = -27..45 px) and the branch left the picture right after.
+LOCK_EDGE_PX = 50.0
+
+
+def _inside(shape, point, margin):
+    h, w = shape[:2]
+    return margin <= point[0] <= w - 1 - margin and margin <= point[1] <= h - 1 - margin
 
 
 def _view_region(shape, point, direction, width):
@@ -433,6 +441,9 @@ class IBVSPipeline:
         if state == "tracking":
             tracked, est = tr.update(frame)
             ctx.extracted_features = tracked
+            if est is None and tr.state == "tracking":
+                print(f"[IBVSPipeline] Frame {frame_n}: blurry frame skipped — still tracking, nothing sent")
+                return
             if est is not None:
                 gap = None if point is None else float(np.linalg.norm(np.asarray(point, dtype=np.float32) - est))
                 if not (self.trust_detections and gap is not None and gap > _match_gate(info.get("size_raw"))):
@@ -482,6 +493,10 @@ class IBVSPipeline:
             self._reacquire(ctx, frame, point, info, frame_n)   # a stored target is never replaced here
             return
         print(f"[IBVSPipeline] Frame {frame_n}: DETECTION mode — detection_point={point}")
+        if point is not None and self.size_tracker is not None and not _inside(frame.shape, point, LOCK_EDGE_PX):
+            print(f"[IBVSPipeline] Frame {frame_n}: detection within {LOCK_EDGE_PX:.0f}px of the image edge — "
+                  f"not locking there yet")
+            point = None
         # A trusted detection is locked on at once; others are confirmed over a few frames first
         locked = (point is not None and tr.lock_at(frame, point)) if self.trust_detections \
             else tr.observe(frame, point)

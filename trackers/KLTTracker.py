@@ -13,6 +13,11 @@ _FB_ERROR_THRESHOLD = 2.0  # px; forward-backward round-trip error above this is
 _STALL_MOTION_PX = 1.5     # px/frame; point motion below this counts as "not moving"
 _STALL_FRAMES_LIMIT = 15   # consecutive stalled frames (after a re-extraction) before treating the lock as bogus
 _MIN_VOTE_FEATURES = 3     # fewer surviving features than this cannot vote for the point -> target lost
+# A jolt of the UAV blurs 2-3 frames (2026-10-12 17:44: sharpness down 3-5x, then back) and every
+# feature fails at once. Such a frame is skipped -- the features stay on the last sharp frame and are
+# tracked from it into the next one -- for up to this many frames before the target counts as lost.
+_BLUR_HOLD_FRAMES = 5
+_BLUR_RATIO = 0.5          # blurry: Laplacian variance below this share of the last tracked frame's
 
 # Candidate confirmation (replaces the old 50-frame warmup): follow the candidate's
 # features over a few consecutive detections and lock once they survive.
@@ -32,6 +37,11 @@ _COAST_DAMPING = 0.7       # per-frame shrink of the coasted velocity
 # 2026-10-11 ArUco approach it ended up half a tag width (126 px) off the tag centre.
 _SIM_INLIER_PX = 2.0       # RANSAC reprojection threshold of the similarity fit
 _SIM_MAX_STEP = 1.25       # a per-frame scale change beyond this (or its inverse) is a bad fit
+
+
+def _sharpness(gray):
+    """Variance of the Laplacian at half resolution: drops several-fold on a motion-blurred frame."""
+    return float(cv2.Laplacian(cv2.pyrDown(gray), cv2.CV_32F).var())
 
 
 class KLTTracker:
@@ -94,6 +104,7 @@ class KLTTracker:
         self._point = None
         self._velocity = np.zeros(2, dtype=np.float32)
         self._stall_streak = 0
+        self._held = 0
         self._reextracted = False
         self._ref_kp_offsets = None
         self._ref_desc = None
@@ -107,6 +118,7 @@ class KLTTracker:
         self._point = np.asarray(point, dtype=np.float32)
         self._velocity = np.zeros(2, dtype=np.float32)
         self._stall_streak = 0
+        self._held = 0
         self._reextracted = False
         self._cand = None
         self._lost_point = None
@@ -255,9 +267,18 @@ class KLTTracker:
         offsets = self._offsets[ok]
 
         if len(pts) < _MIN_VOTE_FEATURES:
+            if self._held < _BLUR_HOLD_FRAMES:
+                sharp, ref = _sharpness(curr_gray), _sharpness(self._prev_gray)
+                if sharp < _BLUR_RATIO * ref:
+                    self._held += 1
+                    print(f"[KLTTracker] Only {len(pts)}/{n_prev} features survived on a blurry frame "
+                          f"(sharpness {sharp:.0f} vs {ref:.0f}) — skipped, holding the last sharp one "
+                          f"({self._held}/{_BLUR_HOLD_FRAMES})")
+                    return np.empty((0, 2), dtype=np.float32), None   # still "tracking": nothing sent
             print(f"[KLTTracker] Only {len(pts)}/{n_prev} features survived — target lost")
             self._lose()
             return np.empty((0, 2), dtype=np.float32), None
+        self._held = 0
 
         # Scale/rotate the stored offsets with the target, then each survivor votes for the point
         offsets = offsets @ self._similarity(self._tracked_pts[ok], pts).T
