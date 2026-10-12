@@ -45,10 +45,17 @@ class KLTTracker:
     stored descriptors are kept so it can be found again).
     """
 
-    def __init__(self, feature_extractor, min_features=8, recovery=True):
+    def __init__(self, feature_extractor, min_features=8, recovery=True, drop_stalled=True):
+        """drop_stalled: drop the target when the point stops moving after a re-extraction (stale-lock
+        guard). Off in branch mode: a UAV holding still over the branch looks exactly like that
+        (4 healthy locks dropped in the 2026-10-12 flight); the TargetModel check covers wrong locks."""
         self.feature_extractor = feature_extractor
         self.min_features = int(min_features)
         self.recovery = bool(recovery)
+        self.drop_stalled = bool(drop_stalled)
+        # Optional callable(frame_shape, point) -> uint8 mask (nonzero = allowed) for new features,
+        # e.g. a strip along the tracked branch; None = anywhere near the point
+        self.feature_region = None
 
         self._orb = cv2.ORB_create(nfeatures=1000) if self.recovery else None
         self._matcher = cv2.BFMatcher(cv2.NORM_HAMMING) if self.recovery else None
@@ -106,8 +113,12 @@ class KLTTracker:
     # ------------------------------------------------------------- features
 
     def _extract_around(self, frame, point):
-        ctx = types.SimpleNamespace(frame=frame, point=np.asarray(point, dtype=np.float32))
-        new_pts = self.feature_extractor.extract(ctx)
+        point = np.asarray(point, dtype=np.float32)
+        mask = self.feature_region(frame.shape, point) if self.feature_region is not None else None
+        new_pts = self.feature_extractor.extract(types.SimpleNamespace(frame=frame, point=point, mask=mask))
+        if mask is not None and len(new_pts) < self.min_features:
+            # too little texture in the region: take features from anywhere near the point
+            new_pts = self.feature_extractor.extract(types.SimpleNamespace(frame=frame, point=point, mask=None))
         return new_pts.reshape(-1, 2).astype(np.float32)
 
     def _make_reference(self, gray, point):
@@ -171,6 +182,25 @@ class KLTTracker:
         else:
             self._cand = None
         return False
+
+    def refresh_features(self, frame):
+        """Replace the tracked features with fresh ones around the current point (point kept),
+        e.g. once feature_region knows where the branch is. Returns False if too few were found."""
+        if not self._locked:
+            return False
+        pts = self._extract_around(frame, self._point)
+        if len(pts) < _MIN_VOTE_FEATURES:
+            return False
+        self._tracked_pts = pts.reshape(-1, 1, 2).astype(np.float32)
+        self._offsets = (pts - self._point).astype(np.float32)
+        self._prev_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        return True
+
+    def shift(self, delta):
+        """Move the tracked point by delta (px) without touching the features."""
+        delta = np.asarray(delta, dtype=np.float32)
+        self._point = self._point + delta
+        self._offsets = self._offsets - delta
 
     def lock_at(self, frame, point):
         """Lock immediately on a trusted detection point (used to re-bind after a loss)."""
@@ -246,7 +276,7 @@ class KLTTracker:
             self._stall_streak += 1
         else:
             self._stall_streak = 0
-        if self._stall_streak >= _STALL_FRAMES_LIMIT:
+        if self.drop_stalled and self._stall_streak >= _STALL_FRAMES_LIMIT:
             print(f"[KLTTracker] Point stalled for {self._stall_streak} frames after re-extraction — "
                   f"likely locked onto static background. Dropping the target.")
             self.unlock()

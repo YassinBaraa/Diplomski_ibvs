@@ -69,6 +69,27 @@ class BranchWidthTracker:
         self._pending = None      # unconfirmed width of the previous frame
         self._missed = 0          # frames since the last accepted width
         self.last_edges = []      # [(left_xy, right_xy)] found on the last measured frame, for drawing
+        self.axis_point = None    # the tracked point moved sideways onto the branch centreline (last accepted frame)
+
+    @property
+    def direction(self):
+        return None if self._dir is None else self._dir.copy()
+
+    @property
+    def width(self):
+        return self._width
+
+    @property
+    def confirmed(self):
+        """The width was measured on the edges (not only the mask's or the TargetModel's guess)."""
+        return self._confirmed
+
+    def expect(self, direction, width):
+        """The branch was found again (TargetModel) at this direction and width: search there and
+        re-confirm the width over 2 frames, without comparing it to the one before the loss."""
+        d = np.asarray(direction, dtype=np.float64)
+        self._dir, self._width = d / np.linalg.norm(d), float(width)
+        self._confirmed, self._pending, self._missed, self.seeded = False, None, 0, True
 
     def seed(self, frame, point, mask, width_hint=None):
         """Learn direction, rough width and polarity of the branch from its segmentation mask
@@ -95,6 +116,7 @@ class BranchWidthTracker:
     def measure(self, frame, point):
         """(width, reason, raw): the branch width at `point` on this frame, or None and why it is
         left out; raw is the measured width even when it is not accepted (None if not measured)."""
+        self.axis_point = None
         if not self.seeded:
             return None, "branch not seeded (no mask at lock)", None
         w_prev, d = self._width, self._dir
@@ -125,7 +147,7 @@ class BranchWidthTracker:
             g = -g                                    # entering the branch is always a fall
         lo_p, hi_p = (0.4, 2.5) if self._confirmed else (0.2, 3.0)
 
-        widths, axis_pts, self.last_edges = [], [], []
+        widths, axis_pts, mids, self.last_edges = [], [], [], []
         for k, t in zip(np.flatnonzero(inside), range(int(inside.sum()))):
             gk = g[t]
             falls, rises = _local_extrema(gk, max(3.0, 0.25 * float(np.abs(gk).max())))
@@ -160,6 +182,7 @@ class BranchWidthTracker:
             left, right = ss[0] + xl * STEP, ss[0] + xr * STEP
             widths.append(right - left)
             axis_pts.append(c + ts[k] * d + 0.5 * (left + right) * n)
+            mids.append(0.5 * (left + right))
             self.last_edges.append((c + ts[k] * d + left * n, c + ts[k] * d + right * n))
 
         if len(widths) < MIN_VALID:
@@ -196,4 +219,6 @@ class BranchWidthTracker:
                 return None, f"width jumped {w_prev:.1f} -> {raw:.1f}px", raw
 
         self._width, self._dir, self._confirmed, self._missed = raw, d_new / np.linalg.norm(d_new), True, 0
+        # centreline at the tracked point: its sideways offset is the median of the cross-section centres
+        self.axis_point = c + float(np.median(mids)) * n
         return raw, None, raw

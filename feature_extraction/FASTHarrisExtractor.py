@@ -27,7 +27,8 @@ class FASTHarrisExtractor(FeatureSelector):
             return np.empty((0, 2), dtype=np.float32)
 
         gray = cv2.cvtColor(ctx.frame, cv2.COLOR_BGR2GRAY)
-        keypoints = self.fast_detector.detect(gray, None)
+        # optional ctx.mask (uint8, nonzero = allowed): e.g. only a strip along the tracked branch
+        keypoints = self.fast_detector.detect(gray, getattr(ctx, "mask", None))
 
         if not keypoints:
             return np.empty((0, 2), dtype=np.float32)

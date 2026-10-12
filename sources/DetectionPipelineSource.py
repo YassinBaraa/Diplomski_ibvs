@@ -37,7 +37,8 @@ class DetectionPipelineSource(FrameSource):
             return False, None, None, {}
 
         best_candidate = data.get("best_candidate")
-        info = {"t_frame": data.get("t_frame"), "size": None, "size_raw": None, "omit": "no branch candidate"}
+        info = {"t_frame": data.get("t_frame"), "size": None, "size_raw": None, "omit": "no branch candidate",
+                "branch_mask": data.get("branch_mask")}
 
         if isinstance(best_candidate, dict):
             x, y = best_candidate.get("x"), best_candidate.get("y")

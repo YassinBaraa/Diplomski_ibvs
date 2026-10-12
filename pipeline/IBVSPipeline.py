@@ -1,4 +1,5 @@
 from pipeline.IBVSContext import IBVSContext
+from trackers.TargetModel import MIN_INLIERS, branch_strip
 import logging
 import numpy as np
 import time
@@ -13,6 +14,24 @@ SIZE_MATCH_MIN_PX = 40.0
 
 def _match_gate(size):
     return max(size or 0.0, SIZE_MATCH_MIN_PX)
+
+
+MODEL_CHECK_EVERY = 5    # tracking frames between checks of the KLT point against the TargetModel
+MIN_SNAP_PX = 8.0        # the KLT point is put back on the stored target when off by more than max(this, 1 width)
+# Finding a lost target again: in 2026-10-12 replays the right re-finds had 10-22 matches at a size
+# within ~x1.3 of the last tracked one, the wrong ones (a fork below the stored spot) 5-8 matches
+# and x0.4-2.6. A re-find needs both; otherwise nothing is sent until one does (or the operator's
+# reset) -- the point never moves to a doubtful spot.
+REFIND_MIN_INLIERS = 10
+REFIND_SCALE = 1.6
+VIEW_AFTER_CHECKS = 3    # agreeing checks in a row (since the last re-find / put-back) before adding a view
+
+
+def _view_region(shape, point, direction, width):
+    """Where a TargetModel view takes its keypoints: a strip along the branch, +-10 widths along it
+    and +-2 across. In 2026-10-12 replays a wider strip (+-6 across) matched background and put
+    the point off the branch, a longer one (+-30 along) stopped matching after the first loss."""
+    return branch_strip(shape, point, direction, width)
 
 
 class IBVSPipeline:
@@ -35,17 +54,33 @@ class IBVSPipeline:
     size_tracker: measures the sent size itself on every tracking frame (branch mode:
       BranchWidthTracker), instead of taking it from the detection, which only exists while
       searching. It is seeded from the detection's mask when the tracker locks and forgotten
-      when the tracker goes back to detection.
+      when the tracker goes back to detection. It also keeps the point on the branch centreline
+      and restricts new KLT features to a strip along the branch.
+
+    target_model: remembers the first locked point (TargetModel) so it is always found again at
+      the same spot: checked every MODEL_CHECK_EVERY frames while tracking (the point is put back
+      if it drifted off), and after a loss the target is only searched through it -- no new point
+      is ever chosen until reset_target() (the operator's 'r').
     """
 
     def __init__(self, source, feature_extractor, tracker=None, controller=None, raw_source=None,
-                 recovery=None, trust_detections=False, size_tracker=None):
+                 recovery=None, trust_detections=False, size_tracker=None, target_model=None):
         self.source = source
         self.feature_extractor = feature_extractor
         self.tracker = tracker
         self.controller = controller
         self.trust_detections = trust_detections
         self.size_tracker = size_tracker
+        self.target_model = target_model
+        self._since_check = 0
+        self._strip_done = False   # features moved onto the branch strip since the last lock
+        self._pending_snap = None  # offset to the stored target seen at the last check, awaiting a 2nd
+        self._capture_wait = 0     # frames until the next try to store the target
+        self._agree = 0            # checks in a row that agreed with the stored target
+        self._last_width = None    # branch width while last tracked, and when (for re-finds)
+        self._last_width_t = None
+        if tracker is not None and size_tracker is not None:
+            tracker.feature_region = self._branch_region
         rec = recovery or {}
         self.recovery_enabled = bool(rec.get("enabled", True))
         self.coast_seconds = float(rec.get("coast_seconds", 0.0))
@@ -102,7 +137,10 @@ class IBVSPipeline:
                 ctx.point = np.asarray(point, dtype=np.float32)
 
             if self.size_tracker is not None and self.tracker is not None:
+                if self.target_model is not None:
+                    self._check_against_model(ctx, frame, frame_n)
                 ctx.target_size, why, raw = self._tracked_size(ctx, frame, point, info, was_tracking)
+                self._hold_on_branch(ctx, frame)
             else:
                 ctx.target_size, why = self._size_at_sent_point(ctx.estimated_point, point, info)
                 raw = info.get("size_raw")
@@ -134,6 +172,26 @@ class IBVSPipeline:
 
             yield ctx
 
+    def reset_target(self):
+        """Operator reset ('r'): forget the target; the next confirmed detection becomes the new one."""
+        if self.tracker is not None:
+            self.tracker.unlock()
+        if self.target_model is not None:
+            self.target_model.reset()
+        if self.size_tracker is not None:
+            self.size_tracker.reset()
+        self._lost_t0, self._strip_done, self._since_check, self._pending_snap = None, False, 0, None
+        self._agree, self._last_width, self._last_width_t = 0, None, None
+
+    def _branch_region(self, shape, point):
+        """Where new KLT features may come from: a strip along the tracked branch, so they move with
+        it (around a thin stick, a circle is mostly ceiling, pipe and wire, which move differently)."""
+        st = self.size_tracker
+        if not st.seeded or not st.width:
+            return None
+        w = st.width
+        return branch_strip(shape, point, st.direction, w, half_len=max(10.0 * w, 100.0), half_wid=max(1.5 * w, 6.0))
+
     def _tracked_size(self, ctx, frame, point, info, was_tracking):
         """(size, reason, raw) from size_tracker, measured at the sent point on this frame."""
         st, state = self.size_tracker, self.tracker.state
@@ -141,15 +199,127 @@ class IBVSPipeline:
             st.reset()
         if state != "tracking" or ctx.estimated_point is None:
             return None, "no point sent" if ctx.estimated_point is None else "target lost", None
-        # (Re)locked on this frame, or not seeded yet: learn the target from this frame's detection
-        # mask, if that detection is the target. A lost target found again without a detection
-        # keeps the previous seed.
+        # Locked on a new target this frame, or not seeded yet: learn the branch from this frame's
+        # detection mask, if that detection is the target. A target found again through the
+        # TargetModel was already re-seeded by it (expect()).
         mask = info.get("mask")
-        if (not was_tracking or not st.seeded) and mask is not None and point is not None and \
+        new_target = not was_tracking and not (self.target_model is not None and self.target_model.active)
+        if (new_target or not st.seeded) and mask is not None and point is not None and \
                 np.linalg.norm(np.asarray(point, dtype=np.float32) - ctx.estimated_point) \
                 <= _match_gate(info.get("size_raw")):
             st.seed(frame, ctx.estimated_point, mask, info.get("size_raw"))
         return st.measure(frame, ctx.estimated_point)
+
+    def _hold_on_branch(self, ctx, frame):
+        """After a width was measured: keep the point on the branch centreline (sideways only),
+        move the features onto the branch strip once, and store the target the first time."""
+        st, tr = self.size_tracker, self.tracker
+        ap = st.axis_point
+        if tr.state != "tracking" or ctx.estimated_point is None or ap is None:
+            return
+        self._last_width, self._last_width_t = st.width, time.monotonic()
+        delta = np.asarray(ap, dtype=np.float32) - tr.point
+        if 0.5 < float(np.linalg.norm(delta)) <= max(st.width, 4.0):
+            tr.shift(delta)
+            ctx.estimated_point = np.round(tr.point).astype(int)
+        if not self._strip_done:
+            self._strip_done = tr.refresh_features(frame)
+            if self._strip_done:
+                ctx.extracted_features = tr.points
+        if self.target_model is not None and not self.target_model.active:
+            self._capture_wait -= 1
+            if self._capture_wait <= 0:
+                self._capture_wait = MODEL_CHECK_EVERY
+                w, d, p = st.width, st.direction, tr.point
+                if self.target_model.add_view(frame, p, d, w, _view_region(frame.shape, p, d, w)):
+                    print(f"[IBVSPipeline] Target stored at {np.round(p).astype(int)} (width {w:.1f}px)")
+
+    def _check_against_model(self, ctx, frame, frame_n):
+        """Every MODEL_CHECK_EVERY tracking frames: find the stored target near the KLT point. Off by
+        more than a branch width on two checks in a row (same offset) -> put the point back there.
+        Otherwise add a view if the target's scale is new."""
+        tm, tr, st = self.target_model, self.tracker, self.size_tracker
+        if not tm.active or tr.state != "tracking" or ctx.estimated_point is None:
+            return
+        self._since_check += 1
+        if self._since_check < MODEL_CHECK_EVERY:
+            return
+        self._since_check = 0
+        est = tr.point
+        w = st.width if st.seeded and st.width else 10.0
+        r = int(max(12.0 * w, 150.0))
+        h, wf = frame.shape[:2]
+        x, y = int(est[0]), int(est[1])
+        search = np.zeros((h, wf), dtype=np.uint8)
+        search[max(y - r, 0):y + r, max(x - r, 0):x + r] = 255
+        res = tm.locate(frame, search)
+        if res is None:
+            return
+        offset = res["point"] - est
+        gap, tol = float(np.linalg.norm(offset)), max(w, MIN_SNAP_PX)
+        if gap > tol:
+            confirmed = self._pending_snap is not None and float(np.linalg.norm(offset - self._pending_snap)) <= tol
+            self._pending_snap = offset
+            if not confirmed:
+                return
+            self._pending_snap, self._agree = None, 0
+            print(f"[IBVSPipeline] Frame {frame_n}: point {gap:.0f}px off the stored target "
+                  f"({res['inliers']} matches) — put back")
+            st.expect(res["direction"], res["width"])
+            tr.unlock()
+            if tr.lock_at(frame, res["point"]):
+                ctx.estimated_point = np.round(tr.point).astype(int)
+                ctx.extracted_features = tr.points
+                self._strip_done = True
+            else:
+                ctx.estimated_point = None   # searched for again from the next frame
+            return
+        self._pending_snap = None
+        self._agree += 1
+        d, wv = (st.direction, st.width) if st.confirmed else (res["direction"], res["width"])
+        if self._agree >= VIEW_AFTER_CHECKS and tm.needs_view(wv) and \
+                tm.add_view(frame, res["point"], d, wv, _view_region(frame.shape, res["point"], d, wv)):
+            print(f"[IBVSPipeline] Frame {frame_n}: target view added at width {wv:.1f}px ({len(tm.views)} views)")
+
+    def _reacquire(self, ctx, frame, point, info, frame_n):
+        """Target lost but stored: look only for the stored target. The detector merely confirms
+        that the spot found is on a branch; it never supplies a new point."""
+        res = self.target_model.locate(frame)
+        why = None
+        if res is not None and res["inliers"] < REFIND_MIN_INLIERS:
+            why = f"only {res['inliers']} matches"
+        elif res is not None and self._last_width:
+            ratio = max(res["width"] / self._last_width, self._last_width / res["width"])
+            if ratio > REFIND_SCALE:
+                why = f"implausible size change x{ratio:.1f} since last tracked"
+        if res is not None and why is None and not self._on_a_branch(res, info, frame.shape):
+            why = "off every detected branch"
+        if res is None or why is not None:
+            print(f"[IBVSPipeline] Frame {frame_n}: searching for the stored target"
+                  + (f" (a match was ignored: {why})" if why else ""))
+            return
+        if self.size_tracker is not None:
+            self.size_tracker.expect(res["direction"], res["width"])
+        if self.tracker.lock_at(frame, res["point"]):
+            ctx.estimated_point = np.round(self.tracker.point).astype(int)
+            ctx.extracted_features = self.tracker.points
+            self._strip_done, self._since_check, self._pending_snap, self._agree = True, 0, None, 0
+            print(f"[IBVSPipeline] Frame {frame_n}: stored target found again "
+                  f"({res['inliers']} matches, x{res['scale']:.2f}) — tracking")
+
+    @staticmethod
+    def _on_a_branch(res, info, shape):
+        """True if the found point lies on (within 2 widths of) a branch the detector segmented this
+        frame. If the detector saw no branch at all, only a strong match counts."""
+        x, y = (int(v) for v in np.round(res["point"]))
+        h, w = shape[:2]
+        if not (0 <= x < w and 0 <= y < h):
+            return False
+        bm = info.get("branch_mask")
+        if bm is None or not np.any(bm):
+            return res["inliers"] >= 2 * MIN_INLIERS
+        r = int(max(2.0 * res["width"], 10.0))
+        return bool(np.any(bm[max(y - r, 0):y + r + 1, max(x - r, 0):x + r + 1]))
 
     @staticmethod
     def _size_at_sent_point(estimated_point, point, info):
@@ -196,6 +366,8 @@ class IBVSPipeline:
                 print(f"[IBVSPipeline] Frame {frame_n}: target LOST — coasting/searching")
                 state = "lost"
             else:
+                if est is None and self.target_model is not None and self.target_model.active:
+                    print(f"[IBVSPipeline] Frame {frame_n}: target LOST — searching for the stored target")
                 state = "idle"
 
         if state == "lost":
@@ -218,13 +390,17 @@ class IBVSPipeline:
             return
 
         # idle: detection mode
-        print(f"[IBVSPipeline] Frame {frame_n}: DETECTION mode — detection_point={point}")
         if point is not None:
             ctx.point = np.asarray(point, dtype=np.float32)
+        if self.target_model is not None and self.target_model.active:
+            self._reacquire(ctx, frame, point, info, frame_n)   # a stored target is never replaced here
+            return
+        print(f"[IBVSPipeline] Frame {frame_n}: DETECTION mode — detection_point={point}")
         # A trusted detection is locked on at once; others are confirmed over a few frames first
         locked = (point is not None and tr.lock_at(frame, point)) if self.trust_detections \
             else tr.observe(frame, point)
         if locked:
             ctx.estimated_point = np.round(tr.point).astype(int)
+            self._strip_done, self._since_check, self._capture_wait = False, 0, 0
             print(f"[IBVSPipeline] Frame {frame_n}: LOCKED — switching to KLT tracking")
         ctx.extracted_features = tr.points
