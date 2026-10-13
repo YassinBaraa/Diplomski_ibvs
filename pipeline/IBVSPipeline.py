@@ -1,5 +1,6 @@
 from pipeline.IBVSContext import IBVSContext
 from trackers.TargetModel import MIN_INLIERS, CROSS_MARGIN, CROSS_MARGIN_PX, branch_strip, crossing_spans
+from trackers.BranchWidthTracker import _crossings
 import cv2
 import contextlib
 import io
@@ -27,7 +28,15 @@ MIN_SNAP_PX = 8.0        # the KLT point is put back on the stored target when o
 # reset) -- the point never moves to a doubtful spot.
 REFIND_MIN_INLIERS = 10
 REFIND_SCALE = 1.6
+# ... but the longer the target was lost, the more its size may have changed: in the 2026-10-13 15:20
+# flight the UAV moved away during a loss (14 -> 7 px) and the correct re-find was refused for 1 s.
+REFIND_SCALE_PER_S = 0.5
+REFIND_SCALE_MAX = 3.0
 VIEW_AFTER_CHECKS = 3    # agreeing checks in a row (since the last re-find / put-back) before adding a view
+# A put-back needs two accepted checks (strong, unambiguous, same scale) with a consistent offset, at
+# most this far apart; rejected checks in between don't cancel it. Requiring them back to back kept the
+# point 200 px off its spot for 22 s in the 2026-10-13 14:57 flight (strong and weak matches alternated).
+PUT_BACK_WINDOW_S = 1.0
 # Branch mode locks only on a detection at least this far inside the image: in the 2026-10-12 17:44
 # flight three locks sat at the top edge (y = -27..45 px) and the branch left the picture right after.
 LOCK_EDGE_PX = 50.0
@@ -43,6 +52,12 @@ PROBE_STEPS = (1, -1, 2, -2, 3, -3, 4, -4, 6, -6)        # [widths] along the br
 # with its spot blocked for a while. Once a size has been sent, the point never changes on its own.
 NO_SIZE_REPICK_S = 2.0
 BAD_SPOT_S = 5.0
+
+
+def _on_crossing(frame, spot, direction, width):
+    """True if a wire or beam crosses behind the branch within CROSS_MARGIN widths of `spot`."""
+    m = max(CROSS_MARGIN * width, CROSS_MARGIN_PX)
+    return any(t0 - m <= 0.0 <= t1 + m for t0, t1 in _crossings(frame, spot, direction, width, max(4.0 * width, 30.0)))
 
 
 def _inside(shape, point, margin):
@@ -98,7 +113,7 @@ class IBVSPipeline:
         self.target_model = target_model
         self._since_check = 0
         self._strip_done = False   # features moved onto the branch strip since the last lock
-        self._pending_snap = None  # offset to the stored target seen at the last check, awaiting a 2nd
+        self._pending_snap = None  # (offset, time) to the stored target seen at an accepted check, awaiting a 2nd
         self._capture_wait = 0     # frames until the next try to store the target
         # for the overlay: this frame's events (LOCKED, LOST, PUT BACK, ...) and where the stored
         # target was last seen relative to the tracked point
@@ -112,6 +127,7 @@ class IBVSPipeline:
         self._probe_det = None     # detection point the probe belongs to
         self._probe_shift = 0.0    # [px] along the branch from the detection to the spot tried
         self._probe_fails = 0
+        self._probe_crossing_ok = False   # no spot off a crossing was found near this detection
         self._probe_seeded = False # the size tracker was seeded from the probe at this lock
         self._lock_t, self._had_size = None, True   # since the lock of a new target, and whether it had a size
         self._bad_spots = []       # [(xy, t)] dropped for having no size
@@ -245,9 +261,19 @@ class IBVSPipeline:
             if mask is None or not pr.seed(frame, det, mask, info.get("size_raw")):
                 self._probe = None
                 return None
-            self._probe, self._probe_shift, self._probe_fails = pr, 0.0, 0
+            self._probe, self._probe_shift, self._probe_fails, self._probe_crossing_ok = pr, 0.0, 0, False
         self._probe_det = det
         spot = det + self._probe_shift * pr.direction
+        # A spot where a wire or beam crosses behind the branch is avoided when another one near it
+        # works (2026-10-13 15:20: the lock and the stored spot sat on a wire crossing, which slides
+        # along the stick as the UAV moves, and every put-back pulled the point 60-136 px with it).
+        crossing = not self._probe_crossing_ok and _inside(frame.shape, spot, LOCK_EDGE_PX) and \
+            _on_crossing(frame, spot, pr.direction, pr.width)
+        if crossing and not self._search_along(frame, det, info, frame_n, avoid_crossings=True):
+            self._probe_crossing_ok = True   # nothing better near it: this spot will do
+            crossing = False
+        if crossing:
+            return None
         if self._usable_spot(frame.shape, spot, pr.width):
             with contextlib.redirect_stdout(io.StringIO()):
                 w, why, _ = pr.measure(frame, spot)
@@ -258,16 +284,18 @@ class IBVSPipeline:
         self._probe_fails += 1
         if self._probe_fails >= PROBE_SEARCH_AFTER:
             self._probe_fails = 0
-            self._search_along(frame, det, info, frame_n)
+            if not self._search_along(frame, det, info, frame_n, avoid_crossings=True):
+                self._search_along(frame, det, info, frame_n)
         return None
 
     def _usable_spot(self, shape, spot, width):
         return _inside(shape, spot, LOCK_EDGE_PX) and \
             all(float(np.linalg.norm(spot - p)) >= max(3.0 * width, 40.0) for p, _ in self._bad_spots)
 
-    def _search_along(self, frame, det, info, frame_n):
-        """No width at the spot tried: try spots along the branch (on its mask), nearest first; the
-        first with clean edges becomes the spot tried (and confirmed over the next frames)."""
+    def _search_along(self, frame, det, info, frame_n, avoid_crossings=False):
+        """No width (or a crossing) at the spot tried: try spots along the branch (on its mask), nearest
+        first; the first with clean edges becomes the spot tried (and confirmed over the next frames).
+        Returns True if one was found."""
         pr, mask = self._probe, info.get("mask")
         d, w = pr.direction, pr.width
         h, wd = frame.shape[:2]
@@ -278,18 +306,20 @@ class IBVSPipeline:
             spot = det + t * d
             x, y = int(round(spot[0])), int(round(spot[1]))
             if not (0 <= x < wd and 0 <= y < h) or mask is None or not mask[y, x] or \
-                    not self._usable_spot(frame.shape, spot, w):
+                    not self._usable_spot(frame.shape, spot, w) or (avoid_crossings and _on_crossing(frame, spot, d, w)):
                 continue
             trial = type(self.size_tracker)()
             trial.expect(d, w, dark=pr.dark)
             with contextlib.redirect_stdout(io.StringIO()):
                 _, why, _ = trial.measure(frame, spot)
             if why is not None and why.startswith("first width not confirmed"):
-                print(f"[IBVSPipeline] Frame {frame_n}: no branch width at the detection — "
-                      f"trying the spot {k:+d} widths along the branch")
+                print(f"[IBVSPipeline] Frame {frame_n}: {'a crossing' if avoid_crossings else 'no branch width'} at the "
+                      f"detection — trying the spot {k:+d} widths along the branch")
                 self._probe, self._probe_shift = trial, t
-                return
-        print(f"[IBVSPipeline] Frame {frame_n}: no branch width at or near the detection — not locking")
+                return True
+        if not avoid_crossings:
+            print(f"[IBVSPipeline] Frame {frame_n}: no branch width at or near the detection — not locking")
+        return False
 
     def _drop_without_size(self, frame_n):
         """A new target with no size NO_SIZE_REPICK_S after its lock is dropped (its spot blocked for
@@ -406,8 +436,8 @@ class IBVSPipeline:
 
     def _check_against_model(self, ctx, frame, frame_n):
         """Every MODEL_CHECK_EVERY tracking frames: find the stored target near the KLT point. Off by
-        more than a branch width on two checks in a row (same offset) -> put the point back there.
-        Otherwise add a view if the target's scale is new."""
+        more than a branch width on two accepted checks within PUT_BACK_WINDOW_S (consistent offset)
+        -> put the point back there. Otherwise add a view if the target's scale is new."""
         tm, tr, st = self.target_model, self.tracker, self.size_tracker
         if not tm.active or tr.state != "tracking" or ctx.estimated_point is None:
             return
@@ -430,19 +460,19 @@ class IBVSPipeline:
         if gap > tol:
             # Only a strong, unambiguous, same-scale match may move the point: in the 2026-10-12 16:11 flight two
             # corrections from 7 matches moved it and turned the width measurement along the stick
-            # (size then stayed off for 100-170 frames). A rejected one also clears a half-confirmed one.
+            # (size then stayed off for 100-170 frames).
             if res["inliers"] < REFIND_MIN_INLIERS or res["ambiguous"] or \
                     (st.confirmed and max(res["width"] / st.width, st.width / res["width"]) > REFIND_SCALE):
-                self._pending_snap = None
                 return
             self.model_offset, self.model_seen_t = offset, time.monotonic()
             # The second offset may differ by half the first: a point sliding along the stick (KLT
             # features slide along its edges) changes the offset every check, and was never put back
             # (16:11 flight: 70-130 px below the stored spot for seconds).
+            now = time.monotonic()
             prev = self._pending_snap
-            confirmed = prev is not None and \
-                float(np.linalg.norm(offset - prev)) <= max(tol, 0.5 * float(np.linalg.norm(prev)))
-            self._pending_snap = offset
+            confirmed = prev is not None and now - prev[1] <= PUT_BACK_WINDOW_S and \
+                float(np.linalg.norm(offset - prev[0])) <= max(tol, 0.5 * float(np.linalg.norm(prev[0])))
+            self._pending_snap = (offset, now)
             if not confirmed:
                 return
             self._pending_snap, self._agree = None, 0
@@ -478,7 +508,8 @@ class IBVSPipeline:
             why = f"only {res['inliers']} matches"
         elif res is not None and self._last_width:
             ratio = max(res["width"] / self._last_width, self._last_width / res["width"])
-            if ratio > REFIND_SCALE:
+            lost_s = time.monotonic() - self._last_width_t if self._last_width_t is not None else 0.0
+            if ratio > min(REFIND_SCALE + REFIND_SCALE_PER_S * lost_s, REFIND_SCALE_MAX):
                 why = f"implausible size change x{ratio:.1f} since last tracked"
         if res is not None and why is None and not self._on_a_branch(res, info, frame.shape):
             why = "off every detected branch"
