@@ -18,6 +18,7 @@ _MIN_VOTE_FEATURES = 3     # fewer surviving features than this cannot vote for 
 # tracked from it into the next one -- for up to this many frames before the target counts as lost.
 _BLUR_HOLD_FRAMES = 5
 _BLUR_RATIO = 0.5          # blurry: Laplacian variance below this share of the last tracked frame's
+_SAME_FEATURE_PX = 3.0     # a new feature this close to a tracked one is that one again
 
 # Candidate confirmation (replaces the old 50-frame warmup): follow the candidate's
 # features over a few consecutive detections and lock once they survive.
@@ -37,6 +38,15 @@ _COAST_DAMPING = 0.7       # per-frame shrink of the coasted velocity
 # 2026-10-11 ArUco approach it ended up half a tag width (126 px) off the tag centre.
 _SIM_INLIER_PX = 2.0       # RANSAC reprojection threshold of the similarity fit
 _SIM_MAX_STEP = 1.25       # a per-frame scale change beyond this (or its inverse) is a bad fit
+
+
+def _merge(pts, offsets, new_pts, point):
+    """The tracked features plus new ones (offsets to `point`), leaving out new near-duplicates."""
+    pts, new_pts = pts.reshape(-1, 2), new_pts.reshape(-1, 2)
+    if len(pts) and len(new_pts):
+        new_pts = new_pts[np.linalg.norm(new_pts[:, None] - pts[None], axis=2).min(axis=1) > _SAME_FEATURE_PX]
+    return (np.concatenate([pts, new_pts]).astype(np.float32),
+            np.concatenate([offsets.reshape(-1, 2), new_pts - np.asarray(point, dtype=np.float32)]).astype(np.float32))
 
 
 def _sharpness(gray):
@@ -214,6 +224,13 @@ class KLTTracker:
         self._prev_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         return True
 
+    def add_features(self, frame):
+        """Add fresh features around the current point to the tracked ones (point kept)."""
+        if not self._locked:
+            return
+        pts, offsets = _merge(self._tracked_pts, self._offsets, self._extract_around(frame, self._point), self._point)
+        self._tracked_pts, self._offsets = pts.reshape(-1, 1, 2), offsets
+
     def keep_features(self, keep):
         """Drop the tracked features where `keep` is False; the point stays."""
         keep = np.asarray(keep, dtype=bool).reshape(-1)
@@ -285,12 +302,15 @@ class KLTTracker:
         est = np.median(pts.reshape(-1, 2) - offsets, axis=0).astype(np.float32)
 
         min_required = max(self.min_features, int(n_prev * MIN_SURVIVAL_RATIO))
+        n_ok = len(pts)
         if len(pts) < min_required:
             new_pts = self._extract_around(frame, est)
             if len(new_pts) > 0:
-                print(f"[KLTTracker] Only {len(pts)}/{n_prev} features survived (need {min_required}) — "
-                      f"re-extracted {len(new_pts)} around {est}")
-                pts, offsets = new_pts.reshape(-1, 1, 2), new_pts - est
+                # Added to the survivors, never instead of them: replacing 5-7 survivors by the 1-4 new
+                # features found near the image edge lost the target on the next frame (2026-10-12 18:05)
+                pts, offsets = _merge(pts, offsets, new_pts, est)
+                print(f"[KLTTracker] Only {n_ok}/{n_prev} features survived (need {min_required}) — "
+                      f"added {len(pts) - n_ok} new around {est}")
                 self._reextracted = True
                 self._make_reference(curr_gray, est)
 

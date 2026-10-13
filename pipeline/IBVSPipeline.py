@@ -1,6 +1,8 @@
 from pipeline.IBVSContext import IBVSContext
 from trackers.TargetModel import MIN_INLIERS, CROSS_MARGIN, CROSS_MARGIN_PX, branch_strip, crossing_spans
 import cv2
+import contextlib
+import io
 import logging
 import numpy as np
 import time
@@ -29,6 +31,18 @@ VIEW_AFTER_CHECKS = 3    # agreeing checks in a row (since the last re-find / pu
 # Branch mode locks only on a detection at least this far inside the image: in the 2026-10-12 17:44
 # flight three locks sat at the top edge (y = -27..45 px) and the branch left the picture right after.
 LOCK_EDGE_PX = 50.0
+
+
+# Branch mode locks only where the branch width (the packet's size) can be measured: the 2026-10-13
+# 10:19 flight locked on the tip of a short stub and had size on 12 % of packets. The width is tried
+# at the detection before locking (2 agreeing frames); after PROBE_SEARCH_AFTER failed frames, spots
+# along the branch are tried instead, nearest first.
+PROBE_SEARCH_AFTER = 8                                   # ~1 s of detection frames
+PROBE_STEPS = (1, -1, 2, -2, 3, -3, 4, -4, 6, -6)        # [widths] along the branch from the detection
+# A new target that has not had a single size this long after its lock is dropped and picked again,
+# with its spot blocked for a while. Once a size has been sent, the point never changes on its own.
+NO_SIZE_REPICK_S = 2.0
+BAD_SPOT_S = 5.0
 
 
 def _inside(shape, point, margin):
@@ -94,6 +108,13 @@ class IBVSPipeline:
         self._since_cleanup = 0    # tracking frames since tracked features were last checked for crossings
         self._last_width = None    # branch width while last tracked, and when (for re-finds)
         self._last_width_t = None
+        self._probe = None         # width tracker trying the detection's spot before a lock (branch mode)
+        self._probe_det = None     # detection point the probe belongs to
+        self._probe_shift = 0.0    # [px] along the branch from the detection to the spot tried
+        self._probe_fails = 0
+        self._probe_seeded = False # the size tracker was seeded from the probe at this lock
+        self._lock_t, self._had_size = None, True   # since the lock of a new target, and whether it had a size
+        self._bad_spots = []       # [(xy, t)] dropped for having no size
         if tracker is not None and size_tracker is not None:
             tracker.feature_region = self._branch_region
             tracker.feature_filter = self._avoid_crossings
@@ -156,7 +177,11 @@ class IBVSPipeline:
                 if self.target_model is not None:
                     self._check_against_model(ctx, frame, frame_n)
                 ctx.target_size, why, raw = self._tracked_size(ctx, frame, point, info, was_tracking)
+                if ctx.target_size is not None:
+                    self._had_size = True
                 self._hold_on_branch(ctx, frame)
+                if self._drop_without_size(frame_n):
+                    ctx.estimated_point, ctx.target_size, why = None, None, "target dropped (no size)"
             else:
                 ctx.target_size, why = self._size_at_sent_point(ctx.estimated_point, point, info)
                 raw = info.get("size_raw")
@@ -192,8 +217,9 @@ class IBVSPipeline:
     def _event(self, name, detail=""):
         self._events.append((name, detail))
 
-    def reset_target(self):
+    def reset_target(self, event=("RESET", "target dropped")):
         """Operator reset ('r'): forget the target; the next confirmed detection becomes the new one."""
+        self._probe, self._probe_seeded, self._lock_t, self._had_size = None, False, None, True
         if self.tracker is not None:
             self.tracker.unlock()
         if self.target_model is not None:
@@ -203,7 +229,80 @@ class IBVSPipeline:
         self._lost_t0, self._strip_done, self._since_check, self._pending_snap = None, False, 0, None
         self._agree, self._last_width, self._last_width_t = 0, None, None
         self.model_offset = None
-        self._event("RESET", "target dropped")
+        self._event(*event)
+
+    def _lock_spot(self, frame, point, info, frame_n):
+        """Branch mode, before a lock: the spot to lock on -- the detection, or a spot along its
+        branch -- once the branch width was measured there on 2 agreeing frames; None until then."""
+        det = np.asarray(point, dtype=np.float64)
+        now = time.monotonic()
+        self._bad_spots = [(p, t) for p, t in self._bad_spots if now - t < BAD_SPOT_S]
+        pr = self._probe
+        if pr is None or self._probe_det is None or \
+                float(np.linalg.norm(det - self._probe_det)) > _match_gate(info.get("size_raw")):
+            mask = info.get("mask")
+            pr = type(self.size_tracker)()
+            if mask is None or not pr.seed(frame, det, mask, info.get("size_raw")):
+                self._probe = None
+                return None
+            self._probe, self._probe_shift, self._probe_fails = pr, 0.0, 0
+        self._probe_det = det
+        spot = det + self._probe_shift * pr.direction
+        if self._usable_spot(frame.shape, spot, pr.width):
+            with contextlib.redirect_stdout(io.StringIO()):
+                w, why, _ = pr.measure(frame, spot)
+            if w is not None:
+                return spot
+            if why.startswith("first width not confirmed"):
+                return None          # edges found: confirmed on the next frame if it agrees
+        self._probe_fails += 1
+        if self._probe_fails >= PROBE_SEARCH_AFTER:
+            self._probe_fails = 0
+            self._search_along(frame, det, info, frame_n)
+        return None
+
+    def _usable_spot(self, shape, spot, width):
+        return _inside(shape, spot, LOCK_EDGE_PX) and \
+            all(float(np.linalg.norm(spot - p)) >= max(3.0 * width, 40.0) for p, _ in self._bad_spots)
+
+    def _search_along(self, frame, det, info, frame_n):
+        """No width at the spot tried: try spots along the branch (on its mask), nearest first; the
+        first with clean edges becomes the spot tried (and confirmed over the next frames)."""
+        pr, mask = self._probe, info.get("mask")
+        d, w = pr.direction, pr.width
+        h, wd = frame.shape[:2]
+        for k in PROBE_STEPS:
+            t = k * w
+            if abs(t - self._probe_shift) < 0.5 * w:
+                continue
+            spot = det + t * d
+            x, y = int(round(spot[0])), int(round(spot[1]))
+            if not (0 <= x < wd and 0 <= y < h) or mask is None or not mask[y, x] or \
+                    not self._usable_spot(frame.shape, spot, w):
+                continue
+            trial = type(self.size_tracker)()
+            trial.expect(d, w, dark=pr.dark)
+            with contextlib.redirect_stdout(io.StringIO()):
+                _, why, _ = trial.measure(frame, spot)
+            if why is not None and why.startswith("first width not confirmed"):
+                print(f"[IBVSPipeline] Frame {frame_n}: no branch width at the detection — "
+                      f"trying the spot {k:+d} widths along the branch")
+                self._probe, self._probe_shift = trial, t
+                return
+        print(f"[IBVSPipeline] Frame {frame_n}: no branch width at or near the detection — not locking")
+
+    def _drop_without_size(self, frame_n):
+        """A new target with no size NO_SIZE_REPICK_S after its lock is dropped (its spot blocked for
+        BAD_SPOT_S) and a new one picked. Returns True if it was dropped."""
+        tr = self.tracker
+        if self._had_size or self._lock_t is None or tr.state != "tracking" or \
+                time.monotonic() - self._lock_t < NO_SIZE_REPICK_S:
+            return False
+        print(f"[IBVSPipeline] Frame {frame_n}: no size {NO_SIZE_REPICK_S:.0f}s after the lock — "
+              f"dropping this target and picking again")
+        self._bad_spots.append((tr.point.astype(np.float64), time.monotonic()))
+        self.reset_target(event=("NO SIZE", "picking again"))
+        return True
 
     def _branch_region(self, shape, point):
         """Where new KLT features may come from: a strip along the tracked branch, so they move with
@@ -241,7 +340,7 @@ class IBVSPipeline:
 
     def _clean_features(self, frame):
         """Every MODEL_CHECK_EVERY tracking frames: drop tracked features that drifted onto a crossing
-        or off the branch; when that leaves fewer than twice the minimum, take fresh ones (point kept).
+        or off the branch; when that leaves fewer than twice the minimum, add fresh ones (point kept).
         Not every frame, and never down to the bare minimum: both made the loop 2x slower and lost the
         target close to the branch (17:36 flight)."""
         tr = self.tracker
@@ -252,10 +351,11 @@ class IBVSPipeline:
         bad = self._bad_features(frame, tr.point, tr.points)
         if bad is None or not bad.any():
             return
-        if (~bad).sum() >= 2 * tr.min_features:
+        good = int((~bad).sum())
+        if good >= 3:
             tr.keep_features(~bad)
-        else:
-            tr.refresh_features(frame)
+        if good < 2 * tr.min_features:
+            tr.add_features(frame)
 
     def _tracked_size(self, ctx, frame, point, info, was_tracking):
         """(size, reason, raw) from size_tracker, measured at the sent point on this frame."""
@@ -269,6 +369,7 @@ class IBVSPipeline:
         # TargetModel was already re-seeded by it (expect()).
         mask = info.get("mask")
         new_target = not was_tracking and not (self.target_model is not None and self.target_model.active)
+        new_target, self._probe_seeded = new_target and not self._probe_seeded, False
         if (new_target or not st.seeded) and mask is not None and point is not None and \
                 np.linalg.norm(np.asarray(point, dtype=np.float32) - ctx.estimated_point) \
                 <= _match_gate(info.get("size_raw")):
@@ -493,16 +594,22 @@ class IBVSPipeline:
             self._reacquire(ctx, frame, point, info, frame_n)   # a stored target is never replaced here
             return
         print(f"[IBVSPipeline] Frame {frame_n}: DETECTION mode — detection_point={point}")
-        if point is not None and self.size_tracker is not None and not _inside(frame.shape, point, LOCK_EDGE_PX):
-            print(f"[IBVSPipeline] Frame {frame_n}: detection within {LOCK_EDGE_PX:.0f}px of the image edge — "
-                  f"not locking there yet")
-            point = None
+        if point is not None and self.size_tracker is not None:
+            if not _inside(frame.shape, point, LOCK_EDGE_PX) and self._probe_shift == 0.0:
+                print(f"[IBVSPipeline] Frame {frame_n}: detection within {LOCK_EDGE_PX:.0f}px of the image edge — "
+                      f"not locking there yet")
+            point = self._lock_spot(frame, point, info, frame_n)
         # A trusted detection is locked on at once; others are confirmed over a few frames first
         locked = (point is not None and tr.lock_at(frame, point)) if self.trust_detections \
             else tr.observe(frame, point)
         if locked:
             ctx.estimated_point = np.round(tr.point).astype(int)
             self._strip_done, self._since_check, self._capture_wait = False, 0, 0
+            if self._probe is not None:   # the width measured before the lock seeds the size tracker
+                self.size_tracker.reset()
+                self.size_tracker.expect(self._probe.direction, self._probe.width, dark=self._probe.dark)
+                self._probe_seeded, self._probe = True, None
+                self._lock_t, self._had_size = time.monotonic(), False
             print(f"[IBVSPipeline] Frame {frame_n}: LOCKED — switching to KLT tracking")
             self._event("LOCKED")
         ctx.extracted_features = tr.points

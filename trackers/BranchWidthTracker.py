@@ -8,14 +8,20 @@ it is darker or brighter than its background. From then on, every frame, short i
 profiles are sampled across the branch at several places around the tracked point; on each,
 the two branch edges are found from the gradient and placed to sub-pixel where the profile is
 half-way between branch and background (blur does not move that point), and the width is the
-median of their distances. Only the edges define the sent width; the mask's own width is just
-a search hint.
+mean of the middle half of their distances. Cross-sections where a wire or beam crosses behind
+the branch are left out. Only the edges define the sent width; the mask's own width is just a
+search hint.
 """
 import cv2
 import numpy as np
 
-N_PROFILES = 9         # cross-sections, spaced along the branch around the tracked point
-MIN_VALID = 5          # cross-sections that must show both edges
+from trackers.TargetModel import crossing_spans
+
+# 17 cross-sections over the same stretch as the earlier 9 (+-2 widths, 48-160 px) and the mean of
+# their middle half: at 6-8 px (far away) the width moved ~2 % frame to frame and ~3 % around its
+# 1 s trend in the 2026-10-12 flights, which is what the UAV's time-to-contact fit sees.
+N_PROFILES = 17        # cross-sections, spaced along the branch around the tracked point
+MIN_VALID = 8          # cross-sections that must show both edges
 STEP = 0.5             # sample spacing along a cross-section, px
 BORDER_MARGIN_PX = 3   # samples this close to the image edge are not used (a branch edge there = touching it)
 MIN_WIDTH_PX = 3.0     # narrower than this, the two edges blur together
@@ -29,7 +35,14 @@ JUMP = 1.3
 # and 5.4 px (steady) on its edges in the 2026-10-11 flight. It is taken once two consecutive
 # frames agree within this.
 CONFIRM_AGREE = 0.15
-MIN_SPACING_PX = 6.0   # cross-sections at least this far apart, so one crossing wire or knot can't spoil most
+MIN_SPACING_PX = 3.0   # cross-sections at least this far apart (a crossing wire or knot spoils only a few)
+MAX_SPACING_PX = 10.0
+CROSSING_GAP_PX = 2.0  # cross-sections this close to a background crossing are left out as well
+# Near the branch's end half the cross-sections lie past it (no edges) and the rest on the tapering
+# tip (2026-10-13 10:19 flight: size on 12 % of packets). When the edges are found only on one side,
+# the cross-sections move that way, a quarter of their stretch per frame, up to half of it.
+WINDOW_STEP = 0.25
+WINDOW_MAX = 0.5
 # A wrong expected width or direction makes every cross-section miss the branch, and both are
 # updated only from successful frames, so they never recover: in the 2026-10-12 16:11 flight a weak
 # correction set the expected width to 6.7 px on a 16-49 px stick and size stayed off for 100-170
@@ -42,9 +55,9 @@ _SMOOTH = cv2.getGaussianKernel(9, 1.0 / STEP).T  # 1 px sigma along each cross-
 
 def _local_extrema(g, thr):
     """Indices of local minima below -thr and local maxima above thr (strongest 4 of each)."""
-    i = np.arange(1, len(g) - 1)
-    mins = i[(g[i] <= g[i - 1]) & (g[i] < g[i + 1]) & (g[i] < -thr)]
-    maxs = i[(g[i] >= g[i - 1]) & (g[i] > g[i + 1]) & (g[i] > thr)]
+    prev, mid, nxt = g[:-2], g[1:-1], g[2:]
+    mins = np.flatnonzero((mid <= prev) & (mid < nxt) & (mid < -thr)) + 1
+    maxs = np.flatnonzero((mid >= prev) & (mid > nxt) & (mid > thr)) + 1
     return mins[np.argsort(g[mins])[:4]], maxs[np.argsort(-g[maxs])[:4]]
 
 
@@ -103,16 +116,39 @@ def _image_width(frame, point, direction, dark, width):
     return (b - a) * STEP
 
 
+def _med(a):
+    """Median of a short 1-D array (np.median costs ~50 us of overhead per call, 3 calls per cross-section)."""
+    a = np.sort(a)
+    n = len(a)
+    return 0.5 * float(a[(n - 1) // 2] + a[n // 2])
+
+
 def _crossing(p, i0, level, radius):
     """Sub-sample position where profile p crosses `level`, nearest to sample i0, or None."""
-    j = np.arange(max(i0 - radius, 0), min(i0 + radius, len(p) - 1))
-    s = p[j] - level
-    hit = j[(s == 0) | (s * (p[j + 1] - level) < 0)]
+    a, b = max(i0 - radius, 0), min(i0 + radius, len(p) - 1)
+    s = p[a:b + 1] - level
+    hit = np.flatnonzero((s[:-1] == 0) | (s[:-1] * s[1:] < 0)) + a
     if len(hit) == 0:
         return None
     k = hit[np.argmin(np.abs(hit - i0))]
     den = p[k + 1] - p[k]
     return float(k) if den == 0 else k + (level - p[k]) / den
+
+
+def _crossings(frame, point, direction, width, half_len):
+    """crossing_spans() around `point`, computed on a small crop only."""
+    reach = 0.5 * width + 3.0 + max(4.0, 0.6 * width) + 2.0
+    d = np.asarray(direction, dtype=np.float64)
+    n = np.array([-d[1], d[0]])
+    c = np.asarray(point, dtype=np.float64)
+    corners = np.array([c + a * half_len * d + b * reach * n for a in (-1, 1) for b in (-1, 1)])
+    H, W = frame.shape[:2]
+    x0, y0 = np.clip(np.floor(corners.min(axis=0)).astype(int), 0, [W - 1, H - 1])
+    x1, y1 = np.clip(np.ceil(corners.max(axis=0)).astype(int) + 1, 1, [W, H])
+    if x1 - x0 < 4 or y1 - y0 < 4:
+        return []
+    gray = cv2.cvtColor(frame[y0:y1, x0:x1], cv2.COLOR_BGR2GRAY)
+    return crossing_spans(gray, c - [x0, y0], d, width, half_len)
 
 
 class BranchWidthTracker:
@@ -129,6 +165,7 @@ class BranchWidthTracker:
         self._confirmed = False   # _width was measured on the edges, not only taken from the mask
         self._pending = None      # unconfirmed width of the previous frame
         self._missed = 0          # frames since the last accepted width
+        self._centre_t = 0.0      # [px] along the branch from the point to the middle of the cross-sections
         self.last_edges = []      # [(left_xy, right_xy)] found on the last measured frame, for drawing
         self.axis_point = None    # the tracked point moved sideways onto the branch centreline (last accepted frame)
         # for the overlay: every cross-section of the last measurement, {centre, edges or None}, and its normal/half-length
@@ -143,16 +180,24 @@ class BranchWidthTracker:
         return self._width
 
     @property
+    def dark(self):
+        """The branch is darker than its background."""
+        return self._dark
+
+    @property
     def confirmed(self):
         """The width was measured on the edges (not only the mask's or the TargetModel's guess)."""
         return self._confirmed
 
-    def expect(self, direction, width):
+    def expect(self, direction, width, dark=None):
         """The branch was found again (TargetModel) at this direction and width: search there and
         re-confirm the width over 2 frames, without comparing it to the one before the loss."""
         d = np.asarray(direction, dtype=np.float64)
         self._dir, self._width = d / np.linalg.norm(d), float(width)
+        if dark is not None:
+            self._dark = bool(dark)
         self._confirmed, self._pending, self._missed, self.seeded = False, None, 0, True
+        self._centre_t = 0.0
 
     def seed(self, frame, point, mask, width_hint=None):
         """Learn direction, rough width and polarity of the branch from its segmentation mask
@@ -174,7 +219,17 @@ class BranchWidthTracker:
         # no width at the point (not on the skeleton): mask area / length across the window
         self._width = float(width_hint) if width_hint else len(xs) / (2.0 * r)
         self._confirmed, self._pending, self._missed, self.seeded = False, None, 0, True
+        self._centre_t = 0.0
         return True
+
+    def _follow_edges(self, found_t, half_span):
+        """After a failed frame: move the cross-sections toward where edges were found, if that is
+        clearly one side of them (the other side being past the branch's end)."""
+        if len(found_t) < 2:
+            return
+        lean = float(np.mean(found_t)) - self._centre_t
+        if abs(lean) > 0.3 * half_span:
+            self._centre_t += float(np.sign(lean)) * WINDOW_STEP * 2 * half_span
 
     def measure(self, frame, point):
         """(width, reason, raw): the branch width at `point` on this frame, or None and why it is
@@ -203,8 +258,10 @@ class BranchWidthTracker:
         n = np.array([-d[1], d[0]])
 
         # Sample points: N_PROFILES cross-sections along the branch, each +-(1.5 widths + 6 px)
-        spacing = float(np.clip(0.5 * w_prev, MIN_SPACING_PX, 20.0))
-        ts = (np.arange(N_PROFILES) - (N_PROFILES - 1) / 2.0) * spacing
+        spacing = float(np.clip(0.25 * w_prev, MIN_SPACING_PX, MAX_SPACING_PX))
+        half_span = (N_PROFILES - 1) / 2.0 * spacing
+        self._centre_t = float(np.clip(self._centre_t, -WINDOW_MAX * 2 * half_span, WINDOW_MAX * 2 * half_span))
+        ts = (np.arange(N_PROFILES) - (N_PROFILES - 1) / 2.0) * spacing + self._centre_t
         ss = np.arange(-(1.5 * w_prev + 6.0), 1.5 * w_prev + 6.0 + STEP / 2, STEP)
         X = c[0] + ts[:, None] * d[0] + ss[None, :] * n[0]
         Y = c[1] + ts[:, None] * d[1] + ss[None, :] * n[1]
@@ -219,6 +276,14 @@ class BranchWidthTracker:
             self._missed += 1
             return None, f"cross-section within {m}px of the image edge", None
 
+        # Where a wire or beam crosses behind the branch the background beside it is dark and the
+        # edges there are wrong: those cross-sections are left out, unless too few would remain.
+        on_crossing = np.zeros(N_PROFILES, dtype=bool)
+        for t0, t1 in _crossings(frame, c, d, w_prev, float(np.abs(ts).max())):
+            on_crossing |= (ts >= t0 - CROSSING_GAP_PX) & (ts <= t1 + CROSSING_GAP_PX)
+        if (inside & ~on_crossing).sum() >= MIN_VALID:
+            inside &= ~on_crossing
+
         Xc, Yc = np.clip(X, 0, W - 1), np.clip(Y, 0, H - 1)
         bx0, by0 = int(np.floor(Xc[inside].min())), int(np.floor(Yc[inside].min()))
         bx1, by1 = int(np.ceil(Xc[inside].max())) + 1, int(np.ceil(Yc[inside].max())) + 1
@@ -232,7 +297,7 @@ class BranchWidthTracker:
             g = -g                                    # entering the branch is always a fall
         lo_p, hi_p = (0.4, 2.5) if self._confirmed else (0.2, 3.0)
 
-        widths, axis_pts, mids, self.last_edges = [], [], [], []
+        widths, axis_pts, mids, self.last_edges, found_t = [], [], [], [], []
         self.last_profiles = [dict(centre=c + t * d, edges=None) for t in ts]
         self.last_normal, self.last_half = n, float(ss[-1])
         for k, t in zip(np.flatnonzero(inside), range(int(inside.sum()))):
@@ -265,7 +330,7 @@ class BranchWidthTracker:
                 continue
             if len(body) == 0 or len(out_l) == 0 or len(out_r) == 0:
                 continue
-            v_in, v_l, v_r = float(np.median(body)), float(np.median(out_l)), float(np.median(out_r))
+            v_in, v_l, v_r = _med(body), _med(out_l), _med(out_r)
             if min(abs(v_in - v_l), abs(v_in - v_r)) < MIN_CONTRAST:
                 continue
             xl, xr = _crossing(pk, li, 0.5 * (v_in + v_l), o), _crossing(pk, ri, 0.5 * (v_in + v_r), o)
@@ -273,6 +338,7 @@ class BranchWidthTracker:
                 continue
             left, right = ss[0] + xl * STEP, ss[0] + xr * STEP
             widths.append(right - left)
+            found_t.append(ts[k])
             axis_pts.append(c + ts[k] * d + 0.5 * (left + right) * n)
             mids.append(0.5 * (left + right))
             self.last_edges.append((c + ts[k] * d + left * n, c + ts[k] * d + right * n))
@@ -280,9 +346,12 @@ class BranchWidthTracker:
 
         if len(widths) < MIN_VALID:
             self._missed += 1
+            self._follow_edges(found_t, half_span)
             return None, f"edges found on only {len(widths)}/{N_PROFILES} cross-sections", None
-        widths = np.asarray(widths)
+        widths = np.sort(np.asarray(widths))
         med = float(np.median(widths))
+        q = len(widths) // 4
+        mid_mean = float(np.mean(widths[q:len(widths) - q]))   # mean of the middle half
 
         # Branch axis through the cross-section centres: corrects for a direction that was off
         # (width measured along the old normal is too wide by 1/cos of the error)
@@ -290,11 +359,12 @@ class BranchWidthTracker:
         evals, evecs = np.linalg.eigh(np.cov((a - a.mean(axis=0)).T))
         d_new = evecs[:, np.argmax(evals)]
         d_new = d_new if np.dot(d_new, d) >= 0 else -d_new
-        raw = med * abs(float(np.dot(n, [-d_new[1], d_new[0]])))
+        raw = mid_mean * abs(float(np.dot(n, [-d_new[1], d_new[0]])))
 
         spread = float(np.median(np.abs(widths - med))) / med
         if spread > MAX_SPREAD:
             self._missed += 1
+            self._follow_edges(found_t, half_span)
             return None, f"cross-sections disagree ({100 * spread:.0f}% spread)", raw
         if raw < MIN_WIDTH_PX:
             self._missed += 1
