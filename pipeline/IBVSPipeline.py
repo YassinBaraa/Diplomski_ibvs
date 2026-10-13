@@ -131,6 +131,10 @@ class IBVSPipeline:
         self._probe_seeded = False # the size tracker was seeded from the probe at this lock
         self._lock_t, self._had_size = None, True   # since the lock of a new target, and whether it had a size
         self._bad_spots = []       # [(xy, t)] dropped for having no size
+        # The UAV is climbing to the branch (set_holding, from the controller's state): the point is
+        # not moved anymore -- no put-backs, no re-pick -- only tracked. A lost target is still
+        # found again (the same stored spot), and the operator's reset ('r') still works.
+        self.holding = False
         if tracker is not None and size_tracker is not None:
             tracker.feature_region = self._branch_region
             tracker.feature_filter = self._avoid_crossings
@@ -233,6 +237,14 @@ class IBVSPipeline:
     def _event(self, name, detail=""):
         self._events.append((name, detail))
 
+    def set_holding(self, holding, why=""):
+        """Hold the point (True while the controller climbs to the branch) or release it."""
+        holding = bool(holding)
+        if holding != self.holding:
+            self.holding = holding
+            print(f"[IBVSPipeline] {'point held' if holding else 'point released'}" + (f" ({why})" if why else ""))
+            self._event("POINT HELD" if holding else "POINT FREE", why)
+
     def reset_target(self, event=("RESET", "target dropped")):
         """Operator reset ('r'): forget the target; the next confirmed detection becomes the new one."""
         self._probe, self._probe_seeded, self._lock_t, self._had_size = None, False, None, True
@@ -325,7 +337,7 @@ class IBVSPipeline:
         """A new target with no size NO_SIZE_REPICK_S after its lock is dropped (its spot blocked for
         BAD_SPOT_S) and a new one picked. Returns True if it was dropped."""
         tr = self.tracker
-        if self._had_size or self._lock_t is None or tr.state != "tracking" or \
+        if self.holding or self._had_size or self._lock_t is None or tr.state != "tracking" or \
                 time.monotonic() - self._lock_t < NO_SIZE_REPICK_S:
             return False
         print(f"[IBVSPipeline] Frame {frame_n}: no size {NO_SIZE_REPICK_S:.0f}s after the lock — "
@@ -465,6 +477,9 @@ class IBVSPipeline:
                     (st.confirmed and max(res["width"] / st.width, st.width / res["width"]) > REFIND_SCALE):
                 return
             self.model_offset, self.model_seen_t = offset, time.monotonic()
+            if self.holding:   # climbing: the point is never moved (2026-10-13 17:47: a 213 px put-back)
+                self._pending_snap = None
+                return
             # The second offset may differ by half the first: a point sliding along the stick (KLT
             # features slide along its edges) changes the offset every check, and was never put back
             # (16:11 flight: 70-130 px below the stored spot for seconds).
