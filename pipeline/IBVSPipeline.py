@@ -7,6 +7,7 @@ import io
 import logging
 import numpy as np
 import time
+from collections import deque
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +38,17 @@ VIEW_AFTER_CHECKS = 3    # agreeing checks in a row (since the last re-find / pu
 # most this far apart; rejected checks in between don't cancel it. Requiring them back to back kept the
 # point 200 px off its spot for 22 s in the 2026-10-13 14:57 flight (strong and weak matches alternated).
 PUT_BACK_WINDOW_S = 1.0
+# No stored-target check while the image moves fast: the ORB match of a blurred frame is unreliable,
+# and the two largest put-backs of the 2026-10-14 12:00 flight (102 and 108 px, onto the wire
+# crossing) came at 20-30 px/frame of image motion.
+PUT_BACK_MAX_SPEED_PX = 8.0   # [px/frame] fastest point motion over the last MODEL_CHECK_EVERY frames
+# A put-back moves the tracker at once, but the sent point follows over this time: the controller
+# sees a ramp instead of a step.
+PUT_BACK_BLEND_S = 0.3
+# With the crossing keypoints left out, fewer keypoints match: a put-back needs this many (a re-find
+# after a loss still REFIND_MIN_INLIERS). In the 2026-10-13 17:24 replay a 74 px put-back from 10
+# matches moved the point towards the tip.
+PUT_BACK_MIN_INLIERS = 14
 # Branch mode locks only on a detection at least this far inside the image: in the 2026-10-12 17:44
 # flight three locks sat at the top edge (y = -27..45 px) and the branch left the picture right after.
 LOCK_EDGE_PX = 50.0
@@ -131,6 +143,9 @@ class IBVSPipeline:
         self._probe_seeded = False # the size tracker was seeded from the probe at this lock
         self._lock_t, self._had_size = None, True   # since the lock of a new target, and whether it had a size
         self._bad_spots = []       # [(xy, t)] dropped for having no size
+        self._speeds = deque(maxlen=MODEL_CHECK_EVERY)   # [px/frame] of the tracked point, last frames
+        self._last_tracked = None  # tracked point of the previous frame (for _speeds)
+        self._blend = None         # (offset of the sent point, start time) after a put-back
         # The UAV is climbing to the branch (set_holding, from the controller's state): the point is
         # not moved anymore -- no put-backs, no re-pick -- only tracked. A lost target is still
         # found again (the same stored spot), and the operator's reset ('r') still works.
@@ -193,6 +208,7 @@ class IBVSPipeline:
             elif point is not None:
                 ctx.point = np.asarray(point, dtype=np.float32)
 
+            self._note_speed()
             if self.size_tracker is not None and self.tracker is not None:
                 if self.target_model is not None:
                     self._check_against_model(ctx, frame, frame_n)
@@ -231,6 +247,7 @@ class IBVSPipeline:
                   f"controller={1000*(t_ctrl1-t_ctrl0):.0f}ms "
                   f"frame_total={1000*(t_ctrl1-t_frame0):.0f}ms")
 
+            self._apply_blend(ctx)
             ctx.debug["events"], self._events = self._events, []
             yield ctx
 
@@ -257,6 +274,8 @@ class IBVSPipeline:
         self._lost_t0, self._strip_done, self._since_check, self._pending_snap = None, False, 0, None
         self._agree, self._last_width, self._last_width_t = 0, None, None
         self.model_offset = None
+        self._speeds.clear()
+        self._last_tracked, self._blend = None, None
         self._event(*event)
 
     def _lock_spot(self, frame, point, info, frame_n):
@@ -446,6 +465,46 @@ class IBVSPipeline:
                     print(f"[IBVSPipeline] Target stored at {np.round(p).astype(int)} (width {w:.1f}px)")
                     self._event("TARGET STORED", f"{w:.1f} px")
 
+    def _note_speed(self):
+        """Per-frame speed of the tracked point (image motion plus any sliding), for the put-back gate."""
+        tr = self.tracker
+        if tr is None or tr.state != "tracking" or tr.point is None:
+            self._last_tracked = None
+            self._speeds.clear()
+            return
+        p = np.asarray(tr.point, dtype=np.float32)
+        if self._last_tracked is not None:
+            self._speeds.append(float(np.linalg.norm(p - self._last_tracked)))
+        self._last_tracked = p.copy()
+
+    def _apply_blend(self, ctx):
+        """After a put-back, move the sent point from where it was to the corrected spot over PUT_BACK_BLEND_S."""
+        if self._blend is None:
+            return
+        offset, t0 = self._blend
+        k = 1.0 - (time.monotonic() - t0) / PUT_BACK_BLEND_S
+        if k <= 0.0 or ctx.estimated_point is None or self.tracker is None or self.tracker.state != "tracking":
+            self._blend = None
+            return
+        ctx.estimated_point = np.round(np.asarray(ctx.estimated_point, dtype=np.float32) + k * offset).astype(int)
+
+    @staticmethod
+    def _mask_crossings(search, frame, point, direction, width, half_len):
+        """Clear from `search` (uint8 mask) the bands across the branch where a wire or beam crosses
+        behind it (crossing_spans), plus CROSS_MARGIN widths on each side."""
+        d = np.asarray(direction, dtype=np.float32)
+        d = d / max(float(np.linalg.norm(d)), 1e-6)
+        spans = crossing_spans(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), point, d, width, float(half_len))
+        if not spans:
+            return
+        m = max(CROSS_MARGIN * width, CROSS_MARGIN_PX)
+        n = np.array([-d[1], d[0]], dtype=np.float32)
+        p = np.asarray(point, dtype=np.float32)
+        L = 1.5 * float(half_len)   # across the branch: beyond the corners of the search square
+        for t0, t1 in spans:        # each band as a filled polygon: cost ~ its area, not the square's
+            a, b = p + (t0 - m) * d, p + (t1 + m) * d
+            cv2.fillConvexPoly(search, np.round(np.array([a - L * n, a + L * n, b + L * n, b - L * n])).astype(np.int32), 0)
+
     def _check_against_model(self, ctx, frame, frame_n):
         """Every MODEL_CHECK_EVERY tracking frames: find the stored target near the KLT point. Off by
         more than a branch width on two accepted checks within PUT_BACK_WINDOW_S (consistent offset)
@@ -457,6 +516,10 @@ class IBVSPipeline:
         if self._since_check < MODEL_CHECK_EVERY:
             return
         self._since_check = 0
+        speed = max(self._speeds, default=0.0)
+        if speed > PUT_BACK_MAX_SPEED_PX:
+            print(f"[IBVSPipeline] Frame {frame_n}: stored-target check skipped (image moving {speed:.0f} px/frame)")
+            return
         est = tr.point
         w = st.width if st.seeded and st.width else 10.0
         r = int(max(12.0 * w, 150.0))
@@ -464,6 +527,12 @@ class IBVSPipeline:
         x, y = int(est[0]), int(est[1])
         search = np.zeros((h, wf), dtype=np.uint8)
         search[max(y - r, 0):y + r, max(x - r, 0):x + r] = 255
+        # Keypoints on wire/beam crossings are left out of this check: the stored target matched best
+        # on the stick-wire crossing, which slides along the stick as the UAV moves, and pulled the
+        # point onto it (2026-10-14 12:00 flight). Re-finds after a loss still use them (_reacquire).
+        # (Not while holding: nothing is put back then, and close to the branch this costs ~5 ms.)
+        if not self.holding and st.seeded and st.width and st.direction is not None:
+            self._mask_crossings(search, frame, est, st.direction, w, r)
         res = tm.locate(frame, search)
         if res is None:
             return
@@ -473,7 +542,7 @@ class IBVSPipeline:
             # Only a strong, unambiguous, same-scale match may move the point: in the 2026-10-12 16:11 flight two
             # corrections from 7 matches moved it and turned the width measurement along the stick
             # (size then stayed off for 100-170 frames).
-            if res["inliers"] < REFIND_MIN_INLIERS or res["ambiguous"] or \
+            if res["inliers"] < PUT_BACK_MIN_INLIERS or res["ambiguous"] or \
                     (st.confirmed and max(res["width"] / st.width, st.width / res["width"]) > REFIND_SCALE):
                 return
             self.model_offset, self.model_seen_t = offset, time.monotonic()
@@ -497,11 +566,14 @@ class IBVSPipeline:
             self.model_offset = np.zeros(2, dtype=np.float32)
             if not st.confirmed:   # otherwise keep the measured direction and width: only the position is corrected
                 st.expect(res["direction"], res["width"])
+            before = np.asarray(tr.point, dtype=np.float32).copy()
             tr.unlock()
             if tr.lock_at(frame, res["point"]):
                 ctx.estimated_point = np.round(tr.point).astype(int)
                 ctx.extracted_features = tr.points
                 self._strip_done = True
+                self._blend = (before - np.asarray(tr.point, dtype=np.float32), time.monotonic())
+                self._last_tracked = None   # the jump is not image motion
             else:
                 ctx.estimated_point = None   # searched for again from the next frame
             return
