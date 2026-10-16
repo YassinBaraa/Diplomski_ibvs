@@ -179,6 +179,7 @@ class KLTTracker:
         """Idle mode: follow one detection candidate over a few frames and lock when
         its features hold up. `point=None` (no candidate this frame) clears it.
         Returns True on the frame the lock happens. Never starts a second lock while one is active."""
+        self.refusal = None   # why this frame did not lock (for the [lock] log line)
         if self._locked:
             return False
         if point is None:
@@ -188,27 +189,38 @@ class KLTTracker:
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         point = np.asarray(point, dtype=np.float32)
         c = self._cand
+        restart = None
         if c is not None:
             next_pts, ok = self._klt(c["gray"], gray, c["pts"])
             n_ok = int(ok.sum())
-            if n_ok >= max(self.min_features, int(len(c["pts"]) * _CONFIRM_SURVIVAL)):
+            need = max(self.min_features, int(len(c["pts"]) * _CONFIRM_SURVIVAL))
+            if n_ok >= need:
                 pts = next_pts[ok]
                 offsets = c["offsets"][ok]
                 est = np.median(pts.reshape(-1, 2) - offsets, axis=0)
-                if np.linalg.norm(est - point) <= _CONFIRM_RADIUS_PX:
+                dist = float(np.linalg.norm(est - point))
+                if dist <= _CONFIRM_RADIUS_PX:
                     c.update(pts=pts, offsets=offsets, gray=gray, hits=c["hits"] + 1)
                     if c["hits"] >= _CONFIRM_FRAMES:
                         self._start_tracking(gray, pts, offsets, est)
                         print(f"[KLTTracker] Locked on {len(pts)} features, point={est}")
                         return True
+                    self.refusal = f"KLT: confirming, frame {c['hits']} of {_CONFIRM_FRAMES}"
                     return False
+                restart = f"KLT: features moved {dist:.0f}px away from the detection (max {_CONFIRM_RADIUS_PX:.0f})"
+            else:
+                restart = f"KLT: only {n_ok}/{len(c['pts'])} features followed to this frame (need {need})"
             c = None
 
         pts = self._extract_around(frame, point)
         if len(pts) >= self.min_features:
             self._cand = dict(pts=pts.reshape(-1, 1, 2), offsets=pts - point, gray=gray, hits=1)
+            self.refusal = (restart + "; started again here") if restart else \
+                f"KLT: confirming, frame 1 of {_CONFIRM_FRAMES}"
         else:
             self._cand = None
+            self.refusal = (restart + "; " if restart else "KLT: ") + \
+                f"only {len(pts)} features around the point (need {self.min_features})"
         return False
 
     def refresh_features(self, frame):
